@@ -9,7 +9,7 @@ package layers
 import (
 	"errors"
 
-	"github.com/google/gopacket"
+	"github.com/malivvan/gopacket"
 )
 
 // An AGUEVar1 header is mostly imaginary, having a length of 0 in its serialized form.

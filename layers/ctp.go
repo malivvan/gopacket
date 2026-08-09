@@ -9,7 +9,8 @@ package layers
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/google/gopacket"
+
+	"github.com/malivvan/gopacket"
 )
 
 // EthernetCTPFunction is the function code used by the EthernetCTP protocol to identify each

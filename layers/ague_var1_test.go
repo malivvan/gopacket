@@ -10,7 +10,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
+	"github.com/malivvan/gopacket"
 )
 
 func logLayers(p gopacket.Packet, t *testing.T) {

@@ -8,13 +8,14 @@ package pcap
 
 import (
 	"bytes"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
 	"io/ioutil"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/malivvan/gopacket"
+	"github.com/malivvan/gopacket/layers"
+	"github.com/malivvan/gopacket/pcapgo"
 )
 
 func TestPCAPGoWrite(t *testing.T) {

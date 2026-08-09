@@ -4,270 +4,299 @@
 // Use of this source code is governed by a BSD-style license
 // that can be found in the LICENSE file in the root of the source
 // tree.
-//
+
+//go:build !windows
 // +build !windows
 
 package pcap
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/google/gopacket"
-
-	"github.com/google/gopacket/layers"
+	"github.com/ebitengine/purego"
+	"github.com/malivvan/gopacket"
+	"github.com/malivvan/gopacket/layers"
+	"golang.org/x/sys/unix"
 )
 
-/*
-#cgo solaris LDFLAGS: -L /opt/local/lib -lpcap
-#cgo linux LDFLAGS: -lpcap
-#cgo dragonfly LDFLAGS: -lpcap
-#cgo freebsd LDFLAGS: -lpcap
-#cgo openbsd LDFLAGS: -lpcap
-#cgo netbsd LDFLAGS: -lpcap
-#cgo darwin LDFLAGS: -lpcap
-#include <stdlib.h>
-#include <pcap.h>
-#include <stdint.h>
-#include <poll.h>
+var pcapLoaded = false
 
-// Some old versions of pcap don't define this constant.
-#ifndef PCAP_NETMASK_UNKNOWN
-#define PCAP_NETMASK_UNKNOWN 0xffffffff
-#endif
-
-// libpcap doesn't actually export its version in a #define-guardable way,
-// so we have to use other defined things to differentiate versions.
-// We assume at least libpcap v1.1 at the moment.
-// See http://upstream-tracker.org/versions/libpcap.html
-
-#ifndef PCAP_ERROR_TSTAMP_PRECISION_NOTSUP  // < v1.5
-#define PCAP_ERROR_TSTAMP_PRECISION_NOTSUP -12
-
-int pcap_set_immediate_mode(pcap_t *p, int mode) {
-  return PCAP_ERROR;
-}
-
-//  libpcap version < v1.5 doesn't have timestamp precision (everything is microsecond)
-//
-//  This means *_tstamp_* functions and macros are missing. Therefore, we emulate these
-//  functions here and pretend the setting the precision works. This is actually the way
-//  the pcap_open_offline_with_tstamp_precision works, because it doesn't return an error
-//  if it was not possible to set the precision, which depends on support by the given file.
-//  => The rest of the functions always pretend as if they could set nano precision and
-//  verify the actual precision with pcap_get_tstamp_precision, which is emulated for <v1.5
-//  to always return micro resolution.
-
-#define PCAP_TSTAMP_PRECISION_MICRO	0
-#define PCAP_TSTAMP_PRECISION_NANO	1
-
-pcap_t *pcap_open_offline_with_tstamp_precision(const char *fname, u_int precision,
-  char *errbuf) {
-  return pcap_open_offline(fname, errbuf);
-}
-
-pcap_t *pcap_fopen_offline_with_tstamp_precision(FILE *fp, u_int precision,
-  char *errbuf) {
-  return pcap_fopen_offline(fp, errbuf);
-}
-
-int pcap_set_tstamp_precision(pcap_t *p, int tstamp_precision) {
-  if (tstamp_precision == PCAP_TSTAMP_PRECISION_MICRO)
-    return 0;
-  return PCAP_ERROR_TSTAMP_PRECISION_NOTSUP;
-}
-
-int pcap_get_tstamp_precision(pcap_t *p) {
-  return PCAP_TSTAMP_PRECISION_MICRO;
-}
-
-#ifndef PCAP_TSTAMP_HOST  // < v1.2
-
-int pcap_set_tstamp_type(pcap_t* p, int t) { return -1; }
-int pcap_list_tstamp_types(pcap_t* p, int** t) { return 0; }
-void pcap_free_tstamp_types(int *tstamp_types) {}
-const char* pcap_tstamp_type_val_to_name(int t) {
-	return "pcap timestamp types not supported";
-}
-int pcap_tstamp_type_name_to_val(const char* t) {
-	return PCAP_ERROR;
-}
-
-#endif  // < v1.2
-#endif  // < v1.5
-
-#ifndef PCAP_ERROR_PROMISC_PERM_DENIED
-#define PCAP_ERROR_PROMISC_PERM_DENIED -11
-#endif
-
-// Windows, Macs, and Linux all use different time types.  Joy.
-#ifdef __APPLE__
-#define gopacket_time_secs_t __darwin_time_t
-#define gopacket_time_usecs_t __darwin_suseconds_t
-#elif __ANDROID__
-#define gopacket_time_secs_t __kernel_time_t
-#define gopacket_time_usecs_t __kernel_suseconds_t
-#elif __GLIBC__
-#define gopacket_time_secs_t __time_t
-#define gopacket_time_usecs_t __suseconds_t
-#else  // Some form of linux/bsd/etc...
-#include <sys/param.h>
-#ifdef __OpenBSD__
-#define gopacket_time_secs_t u_int32_t
-#define gopacket_time_usecs_t u_int32_t
-#else
-#define gopacket_time_secs_t time_t
-#define gopacket_time_usecs_t suseconds_t
-#endif
-#endif
-
-// The things we do to avoid pointers escaping to the heap...
-// According to https://github.com/the-tcpdump-group/libpcap/blob/1131a7c26c6f4d4772e4a2beeaf7212f4dea74ac/pcap.c#L398-L406 ,
-// the return value of pcap_next_ex could be greater than 1 for success.
-// Let's just make it 1 if it comes bigger than 1.
-int pcap_next_ex_escaping(pcap_t *p, uintptr_t pkt_hdr, uintptr_t pkt_data) {
-  int ex = pcap_next_ex(p, (struct pcap_pkthdr**)(pkt_hdr), (const u_char**)(pkt_data));
-  if (ex > 1) {
-    ex = 1;
-  }
-  return ex;
-}
-
-int pcap_offline_filter_escaping(struct bpf_program *fp, uintptr_t pkt_hdr, uintptr_t pkt) {
-	return pcap_offline_filter(fp, (struct pcap_pkthdr*)(pkt_hdr), (const u_char*)(pkt));
-}
-
-// pcap_wait returns when the next packet is available or the timeout expires.
-// Since it uses pcap_get_selectable_fd, it will not work in Windows.
-int pcap_wait(pcap_t *p, int msec) {
-	struct pollfd fds[1];
-	int fd;
-
-	fd = pcap_get_selectable_fd(p);
-	if(fd < 0) {
-		return fd;
-	}
-
-	fds[0].fd = fd;
-	fds[0].events = POLLIN;
-
-	if(msec != 0) {
-		return poll(fds, 1, msec);
-	}
-
-	// block indefinitely if no timeout provided
-	return poll(fds, 1, -1);
-}
-
-*/
-import "C"
-
-const errorBufferSize = C.PCAP_ERRBUF_SIZE
-
-const (
-	pcapErrorNotActivated    = C.PCAP_ERROR_NOT_ACTIVATED
-	pcapErrorActivated       = C.PCAP_ERROR_ACTIVATED
-	pcapWarningPromisc       = C.PCAP_WARNING_PROMISC_NOTSUP
-	pcapErrorNoSuchDevice    = C.PCAP_ERROR_NO_SUCH_DEVICE
-	pcapErrorDenied          = C.PCAP_ERROR_PERM_DENIED
-	pcapErrorNotUp           = C.PCAP_ERROR_IFACE_NOT_UP
-	pcapWarning              = C.PCAP_WARNING
-	pcapError                = C.PCAP_ERROR
-	pcapDIN                  = C.PCAP_D_IN
-	pcapDOUT                 = C.PCAP_D_OUT
-	pcapDINOUT               = C.PCAP_D_INOUT
-	pcapNetmaskUnknown       = C.PCAP_NETMASK_UNKNOWN
-	pcapTstampPrecisionMicro = C.PCAP_TSTAMP_PRECISION_MICRO
-	pcapTstampPrecisionNano  = C.PCAP_TSTAMP_PRECISION_NANO
+var (
+	pcapHandle  uintptr
+	pcapLoadErr error
 )
 
-type pcapPkthdr C.struct_pcap_pkthdr
-type pcapTPtr *C.struct_pcap
-type pcapBpfProgram C.struct_bpf_program
+var (
+	pcapStrerrorPtr,
+	pcapStatustostrPtr,
+	pcapOpenLivePtr,
+	pcapOpenOfflinePtr,
+	pcapClosePtr,
+	pcapGeterrPtr,
+	pcapStatsPtr,
+	pcapCompilePtr,
+	pcapFreecodePtr,
+	pcapLookupnetPtr,
+	pcapOfflineFilterPtr,
+	pcapSetfilterPtr,
+	pcapListDatalinksPtr,
+	pcapFreeDatalinksPtr,
+	pcapDatalinkValToNamePtr,
+	pcapDatalinkValToDescriptionPtr,
+	pcapOpenDeadPtr,
+	pcapNextExPtr,
+	pcapDatalinkPtr,
+	pcapSetDatalinkPtr,
+	pcapDatalinkNameToValPtr,
+	pcapLibVersionPtr,
+	pcapFreealldevsPtr,
+	pcapFindalldevsPtr,
+	pcapSendpacketPtr,
+	pcapSetdirectionPtr,
+	pcapSnapshotPtr,
+	pcapTstampTypeValToNamePtr,
+	pcapTstampTypeNameToValPtr,
+	pcapListTstampTypesPtr,
+	pcapFreeTstampTypesPtr,
+	pcapSetTstampTypePtr,
+	pcapGetTstampPrecisionPtr,
+	pcapSetTstampPrecisionPtr,
+	pcapOpenOfflineWithTstampPrecisionPtr,
+	pcapActivatePtr,
+	pcapCreatePtr,
+	pcapSetSnaplenPtr,
+	pcapSetPromiscPtr,
+	pcapSetTimeoutPtr,
+	pcapCanSetRfmonPtr,
+	pcapSetRfmonPtr,
+	pcapSetBufferSizePtr,
+	pcapSetImmediateModePtr,
+	pcapSetNonBlockPtr,
+	pcapGetSelectableFdPtr uintptr
+)
+
+func init() {
+	LoadUnixPCAP()
+}
+
+// LoadUnixPCAP attempts to dynamically load the libpcap shared library and resolve necessary functions.
+func LoadUnixPCAP() error {
+	if pcapLoaded {
+		return pcapLoadErr
+	}
+
+	names := []string{
+		"libpcap.so.1",
+		"libpcap.so",
+		"libpcap.dylib",
+		"libpcap.so.0.8",
+	}
+	for _, name := range names {
+		pcapHandle, pcapLoadErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		if pcapLoadErr == nil {
+			break
+		}
+	}
+	if pcapLoadErr != nil {
+		pcapLoadErr = fmt.Errorf("couldn't load libpcap: %w", pcapLoadErr)
+		pcapLoaded = true
+		return pcapLoadErr
+	}
+
+	pcapStrerrorPtr = mustLoad("pcap_strerror")
+	pcapStatustostrPtr = mightLoad("pcap_statustostr")
+	pcapOpenLivePtr = mustLoad("pcap_open_live")
+	pcapOpenOfflinePtr = mustLoad("pcap_open_offline")
+	pcapClosePtr = mustLoad("pcap_close")
+	pcapGeterrPtr = mustLoad("pcap_geterr")
+	pcapStatsPtr = mustLoad("pcap_stats")
+	pcapCompilePtr = mustLoad("pcap_compile")
+	pcapFreecodePtr = mustLoad("pcap_freecode")
+	pcapLookupnetPtr = mustLoad("pcap_lookupnet")
+	pcapOfflineFilterPtr = mustLoad("pcap_offline_filter")
+	pcapSetfilterPtr = mustLoad("pcap_setfilter")
+	pcapListDatalinksPtr = mustLoad("pcap_list_datalinks")
+	pcapFreeDatalinksPtr = mustLoad("pcap_free_datalinks")
+	pcapDatalinkValToNamePtr = mustLoad("pcap_datalink_val_to_name")
+	pcapDatalinkValToDescriptionPtr = mustLoad("pcap_datalink_val_to_description")
+	pcapOpenDeadPtr = mustLoad("pcap_open_dead")
+	pcapNextExPtr = mustLoad("pcap_next_ex")
+	pcapDatalinkPtr = mustLoad("pcap_datalink")
+	pcapSetDatalinkPtr = mustLoad("pcap_set_datalink")
+	pcapDatalinkNameToValPtr = mustLoad("pcap_datalink_name_to_val")
+	pcapLibVersionPtr = mustLoad("pcap_lib_version")
+	pcapFreealldevsPtr = mustLoad("pcap_freealldevs")
+	pcapFindalldevsPtr = mustLoad("pcap_findalldevs")
+	pcapSendpacketPtr = mustLoad("pcap_sendpacket")
+	pcapSetdirectionPtr = mustLoad("pcap_setdirection")
+	pcapSnapshotPtr = mustLoad("pcap_snapshot")
+	pcapTstampTypeValToNamePtr = mightLoad("pcap_tstamp_type_val_to_name")
+	pcapTstampTypeNameToValPtr = mightLoad("pcap_tstamp_type_name_to_val")
+	pcapListTstampTypesPtr = mightLoad("pcap_list_tstamp_types")
+	pcapFreeTstampTypesPtr = mightLoad("pcap_free_tstamp_types")
+	pcapSetTstampTypePtr = mightLoad("pcap_set_tstamp_type")
+	pcapGetTstampPrecisionPtr = mightLoad("pcap_get_tstamp_precision")
+	pcapSetTstampPrecisionPtr = mightLoad("pcap_set_tstamp_precision")
+	pcapOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_open_offline_with_tstamp_precision")
+	pcapActivatePtr = mustLoad("pcap_activate")
+	pcapCreatePtr = mustLoad("pcap_create")
+	pcapSetSnaplenPtr = mustLoad("pcap_set_snaplen")
+	pcapSetPromiscPtr = mustLoad("pcap_set_promisc")
+	pcapSetTimeoutPtr = mustLoad("pcap_set_timeout")
+	pcapCanSetRfmonPtr = mightLoad("pcap_can_set_rfmon")
+	pcapSetRfmonPtr = mightLoad("pcap_set_rfmon")
+	pcapSetBufferSizePtr = mustLoad("pcap_set_buffer_size")
+	pcapSetImmediateModePtr = mightLoad("pcap_set_immediate_mode")
+	pcapSetNonBlockPtr = mustLoad("pcap_setnonblock")
+	pcapGetSelectableFdPtr = mustLoad("pcap_get_selectable_fd")
+
+	pcapLoaded = true
+	return nil
+}
+
+func mustLoad(name string) uintptr {
+	sym, err := purego.Dlsym(pcapHandle, name)
+	if err != nil {
+		panic(fmt.Sprintf("couldn't load function %s from libpcap: %v", name, err))
+	}
+	return sym
+}
+
+func mightLoad(name string) uintptr {
+	sym, _ := purego.Dlsym(pcapHandle, name)
+	return sym
+}
 
 func (h *pcapPkthdr) getSec() int64 {
-	return int64(h.ts.tv_sec)
+	return int64(h.Ts.Sec)
 }
 
 func (h *pcapPkthdr) getUsec() int64 {
-	return int64(h.ts.tv_usec)
+	return int64(h.Ts.Usec)
 }
 
 func (h *pcapPkthdr) getLen() int {
-	return int(h.len)
+	return int(h.Len)
 }
 
 func (h *pcapPkthdr) getCaplen() int {
-	return int(h.caplen)
+	return int(h.Caplen)
+}
+
+func statusError(status pcapCint) error {
+	var ret uintptr
+	if pcapStatustostrPtr == 0 {
+		ret, _, _ = purego.SyscallN(pcapStrerrorPtr, uintptr(status))
+	} else {
+		ret, _, _ = purego.SyscallN(pcapStatustostrPtr, uintptr(status))
+	}
+	return errors.New(bytePtrToString(ret))
 }
 
 func pcapGetTstampPrecision(cptr pcapTPtr) int {
-	return int(C.pcap_get_tstamp_precision(cptr))
+	if pcapGetTstampPrecisionPtr == 0 {
+		return pcapTstampPrecisionMicro
+	}
+	ret, _, _ := purego.SyscallN(pcapGetTstampPrecisionPtr, uintptr(cptr))
+	return int(pcapCint(ret))
 }
 
 func pcapSetTstampPrecision(cptr pcapTPtr, precision int) error {
-	ret := C.pcap_set_tstamp_precision(cptr, C.int(precision))
-	if ret < 0 {
-		return errors.New(C.GoString(C.pcap_geterr(cptr)))
+	if pcapSetTstampPrecisionPtr == 0 {
+		return errors.New("not supported")
+	}
+	ret, _, _ := purego.SyscallN(pcapSetTstampPrecisionPtr, uintptr(cptr), uintptr(precision))
+	if pcapCint(ret) < 0 {
+		return errors.New("not supported")
 	}
 	return nil
 }
 
-func statusError(status C.int) error {
-	return errors.New(C.GoString(C.pcap_statustostr(status)))
-}
-
 func pcapOpenLive(device string, snaplen int, pro int, timeout int) (*Handle, error) {
-	buf := (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(buf))
-
-	dev := C.CString(device)
-	defer C.free(unsafe.Pointer(dev))
-
-	cptr := C.pcap_open_live(dev, C.int(snaplen), C.int(pro), C.int(timeout), buf)
-	if cptr == nil {
-		return nil, errors.New(C.GoString(buf))
+	err := LoadUnixPCAP()
+	if err != nil {
+		return nil, err
 	}
-	return &Handle{cptr: cptr}, nil
+
+	buf := make([]byte, errorBufferSize)
+	dev, err := syscall.BytePtrFromString(device)
+	if err != nil {
+		return nil, err
+	}
+
+	cptr, _, _ := purego.SyscallN(pcapOpenLivePtr,
+		uintptr(unsafe.Pointer(dev)),
+		uintptr(snaplen),
+		uintptr(pro),
+		uintptr(timeout),
+		uintptr(unsafe.Pointer(&buf[0])),
+	)
+	if cptr == 0 {
+		return nil, errors.New(byteSliceToString(buf))
+	}
+	return &Handle{cptr: pcapTPtr(cptr)}, nil
 }
 
 func openOffline(file string) (handle *Handle, err error) {
-	buf := (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(buf))
-	cf := C.CString(file)
-	defer C.free(unsafe.Pointer(cf))
-
-	cptr := C.pcap_open_offline_with_tstamp_precision(cf, C.PCAP_TSTAMP_PRECISION_NANO, buf)
-	if cptr == nil {
-		return nil, errors.New(C.GoString(buf))
+	err = LoadUnixPCAP()
+	if err != nil {
+		return nil, err
 	}
-	return &Handle{cptr: cptr}, nil
+
+	buf := make([]byte, errorBufferSize)
+	f, err := syscall.BytePtrFromString(file)
+	if err != nil {
+		return nil, err
+	}
+
+	var cptr uintptr
+	if pcapOpenOfflineWithTstampPrecisionPtr == 0 {
+		cptr, _, _ = purego.SyscallN(pcapOpenOfflinePtr,
+			uintptr(unsafe.Pointer(f)),
+			uintptr(unsafe.Pointer(&buf[0])),
+		)
+	} else {
+		cptr, _, _ = purego.SyscallN(pcapOpenOfflineWithTstampPrecisionPtr,
+			uintptr(unsafe.Pointer(f)),
+			uintptr(pcapTstampPrecisionNano),
+			uintptr(unsafe.Pointer(&buf[0])),
+		)
+	}
+	if cptr == 0 {
+		return nil, errors.New(byteSliceToString(buf))
+	}
+	return &Handle{cptr: pcapTPtr(cptr)}, nil
 }
 
 func (p *Handle) pcapClose() {
-	if p.cptr != nil {
-		C.pcap_close(p.cptr)
+	if p.cptr != 0 {
+		purego.SyscallN(pcapClosePtr, uintptr(p.cptr))
 	}
-	p.cptr = nil
+	p.cptr = 0
 }
 
 func (p *Handle) pcapGeterr() error {
-	return errors.New(C.GoString(C.pcap_geterr(p.cptr)))
+	ret, _, _ := purego.SyscallN(pcapGeterrPtr, uintptr(p.cptr))
+	return errors.New(bytePtrToString(ret))
 }
 
 func (p *Handle) pcapStats() (*Stats, error) {
-	var cstats C.struct_pcap_stat
-	if C.pcap_stats(p.cptr, &cstats) < 0 {
+	var cstats pcapStats
+	ret, _, _ := purego.SyscallN(pcapStatsPtr, uintptr(p.cptr), uintptr(unsafe.Pointer(&cstats)))
+	if pcapCint(ret) < 0 {
 		return nil, p.pcapGeterr()
 	}
 	return &Stats{
-		PacketsReceived:  int(cstats.ps_recv),
-		PacketsDropped:   int(cstats.ps_drop),
-		PacketsIfDropped: int(cstats.ps_ifdrop),
+		PacketsReceived:  int(cstats.Recv),
+		PacketsDropped:   int(cstats.Drop),
+		PacketsIfDropped: int(cstats.Ifdrop),
 	}, nil
 }
 
@@ -276,101 +305,115 @@ var pcapCompileMu sync.Mutex
 
 func (p *Handle) pcapCompile(expr string, maskp uint32) (pcapBpfProgram, error) {
 	var bpf pcapBpfProgram
-	cexpr := C.CString(expr)
-	defer C.free(unsafe.Pointer(cexpr))
-
+	cexpr, err := syscall.BytePtrFromString(expr)
+	if err != nil {
+		return pcapBpfProgram{}, err
+	}
 	pcapCompileMu.Lock()
 	defer pcapCompileMu.Unlock()
-	if C.pcap_compile(p.cptr, (*C.struct_bpf_program)(&bpf), cexpr, 1, C.bpf_u_int32(maskp)) < 0 {
+	res, _, _ := purego.SyscallN(pcapCompilePtr,
+		uintptr(p.cptr),
+		uintptr(unsafe.Pointer(&bpf)),
+		uintptr(unsafe.Pointer(cexpr)),
+		uintptr(1),
+		uintptr(maskp),
+	)
+	if pcapCint(res) < 0 {
 		return bpf, p.pcapGeterr()
 	}
 	return bpf, nil
 }
 
 func (p pcapBpfProgram) free() {
-	C.pcap_freecode((*C.struct_bpf_program)(&p))
+	purego.SyscallN(pcapFreecodePtr, uintptr(unsafe.Pointer(&p)))
 }
 
 func (p pcapBpfProgram) toBPFInstruction() []BPFInstruction {
-	bpfInsn := (*[bpfInstructionBufferSize]C.struct_bpf_insn)(unsafe.Pointer(p.bf_insns))[0:p.bf_len:p.bf_len]
-	bpfInstruction := make([]BPFInstruction, len(bpfInsn), len(bpfInsn))
+	bpfInsn := (*[bpfInstructionBufferSize]pcapBpfInstruction)(unsafe.Pointer(p.Insns))[0:p.Len:p.Len]
+	bpfInstruction := make([]BPFInstruction, len(bpfInsn))
 
 	for i, v := range bpfInsn {
-		bpfInstruction[i].Code = uint16(v.code)
-		bpfInstruction[i].Jt = uint8(v.jt)
-		bpfInstruction[i].Jf = uint8(v.jf)
-		bpfInstruction[i].K = uint32(v.k)
+		bpfInstruction[i].Code = v.Code
+		bpfInstruction[i].Jt = v.Jt
+		bpfInstruction[i].Jf = v.Jf
+		bpfInstruction[i].K = v.K
 	}
 	return bpfInstruction
 }
 
 func pcapBpfProgramFromInstructions(bpfInstructions []BPFInstruction) pcapBpfProgram {
 	var bpf pcapBpfProgram
-	bpf.bf_len = C.u_int(len(bpfInstructions))
-	cbpfInsns := C.calloc(C.size_t(len(bpfInstructions)), C.size_t(unsafe.Sizeof(bpfInstructions[0])))
-	gbpfInsns := (*[bpfInstructionBufferSize]C.struct_bpf_insn)(cbpfInsns)
+	bpf.Len = uint32(len(bpfInstructions))
+	insns := make([]pcapBpfInstruction, len(bpfInstructions))
 
 	for i, v := range bpfInstructions {
-		gbpfInsns[i].code = C.u_short(v.Code)
-		gbpfInsns[i].jt = C.u_char(v.Jt)
-		gbpfInsns[i].jf = C.u_char(v.Jf)
-		gbpfInsns[i].k = C.bpf_u_int32(v.K)
+		insns[i].Code = v.Code
+		insns[i].Jt = v.Jt
+		insns[i].Jf = v.Jf
+		insns[i].K = v.K
 	}
 
-	bpf.bf_insns = (*C.struct_bpf_insn)(cbpfInsns)
+	bpf.Insns = &insns[0]
+	runtime.KeepAlive(insns)
 	return bpf
 }
 
 func pcapLookupnet(device string) (netp, maskp uint32, err error) {
-	errorBuf := (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(errorBuf))
-	dev := C.CString(device)
-	defer C.free(unsafe.Pointer(dev))
-	if C.pcap_lookupnet(
-		dev,
-		(*C.bpf_u_int32)(unsafe.Pointer(&netp)),
-		(*C.bpf_u_int32)(unsafe.Pointer(&maskp)),
-		errorBuf,
-	) < 0 {
-		return 0, 0, errors.New(C.GoString(errorBuf))
-		// We can't lookup the network, but that could be because the interface
-		// doesn't have an IPv4.
+	err = LoadUnixPCAP()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	buf := make([]byte, errorBufferSize)
+	dev, err := syscall.BytePtrFromString(device)
+	if err != nil {
+		return 0, 0, err
+	}
+	e, _, _ := purego.SyscallN(pcapLookupnetPtr,
+		uintptr(unsafe.Pointer(dev)),
+		uintptr(unsafe.Pointer(&netp)),
+		uintptr(unsafe.Pointer(&maskp)),
+		uintptr(unsafe.Pointer(&buf[0])),
+	)
+	if pcapCint(e) < 0 {
+		return 0, 0, errors.New(byteSliceToString(buf))
 	}
 	return
 }
 
 func (b *BPF) pcapOfflineFilter(ci gopacket.CaptureInfo, data []byte) bool {
-	hdr := (*C.struct_pcap_pkthdr)(&b.hdr)
-	hdr.ts.tv_sec = C.gopacket_time_secs_t(ci.Timestamp.Unix())
-	hdr.ts.tv_usec = C.gopacket_time_usecs_t(ci.Timestamp.Nanosecond() / 1000)
-	hdr.caplen = C.bpf_u_int32(len(data)) // Trust actual length over ci.Length.
-	hdr.len = C.bpf_u_int32(ci.Length)
-	dataptr := (*C.u_char)(unsafe.Pointer(&data[0]))
-	return C.pcap_offline_filter_escaping((*C.struct_bpf_program)(&b.bpf.bpf),
-		C.uintptr_t(uintptr(unsafe.Pointer(hdr))),
-		C.uintptr_t(uintptr(unsafe.Pointer(dataptr)))) != 0
+	hdr := &b.hdr
+	hdr.Ts = unix.NsecToTimeval(ci.Timestamp.UnixNano())
+	hdr.Caplen = uint32(len(data))
+	hdr.Len = uint32(ci.Length)
+	e, _, _ := purego.SyscallN(pcapOfflineFilterPtr,
+		uintptr(unsafe.Pointer(&b.bpf.bpf)),
+		uintptr(unsafe.Pointer(hdr)),
+		uintptr(unsafe.Pointer(&data[0])),
+	)
+	return e != 0
 }
 
 func (p *Handle) pcapSetfilter(bpf pcapBpfProgram) error {
-	if C.pcap_setfilter(p.cptr, (*C.struct_bpf_program)(&bpf)) < 0 {
+	e, _, _ := purego.SyscallN(pcapSetfilterPtr, uintptr(p.cptr), uintptr(unsafe.Pointer(&bpf)))
+	if pcapCint(e) < 0 {
 		return p.pcapGeterr()
 	}
 	return nil
 }
 
 func (p *Handle) pcapListDatalinks() (datalinks []Datalink, err error) {
-	var dltbuf *C.int
+	var dltbuf *pcapCint
 
-	n := int(C.pcap_list_datalinks(p.cptr, &dltbuf))
+	ret, _, _ := purego.SyscallN(pcapListDatalinksPtr, uintptr(p.cptr), uintptr(unsafe.Pointer(&dltbuf)))
+	n := int(pcapCint(ret))
 	if n < 0 {
 		return nil, p.pcapGeterr()
 	}
-
-	defer C.pcap_free_datalinks(dltbuf)
+	defer purego.SyscallN(pcapFreeDatalinksPtr, uintptr(unsafe.Pointer(dltbuf)))
 
 	datalinks = make([]Datalink, n)
-
-	dltArray := (*[1 << 28]C.int)(unsafe.Pointer(dltbuf))
+	dltArray := (*[1 << 28]pcapCint)(unsafe.Pointer(dltbuf))
 
 	for i := 0; i < n; i++ {
 		datalinks[i].Name = pcapDatalinkValToName(int((*dltArray)[i]))
@@ -381,62 +424,95 @@ func (p *Handle) pcapListDatalinks() (datalinks []Datalink, err error) {
 }
 
 func pcapOpenDead(linkType layers.LinkType, captureLength int) (*Handle, error) {
-	cptr := C.pcap_open_dead(C.int(linkType), C.int(captureLength))
-	if cptr == nil {
+	err := LoadUnixPCAP()
+	if err != nil {
+		return nil, err
+	}
+
+	cptr, _, _ := purego.SyscallN(pcapOpenDeadPtr, uintptr(linkType), uintptr(captureLength))
+	if cptr == 0 {
 		return nil, errors.New("error opening dead capture")
 	}
 
-	return &Handle{cptr: cptr}, nil
+	return &Handle{cptr: pcapTPtr(cptr)}, nil
 }
 
 func (p *Handle) pcapNextPacketEx() NextError {
-	// This horrible magic allows us to pass a ptr-to-ptr to pcap_next_ex
-	// without causing that ptr-to-ptr to itself be allocated on the heap.
-	// Since Handle itself survives through the duration of the pcap_next_ex
-	// call, this should be perfectly safe for GC stuff, etc.
-
-	return NextError(C.pcap_next_ex_escaping(p.cptr, C.uintptr_t(uintptr(unsafe.Pointer(&p.pkthdr))), C.uintptr_t(uintptr(unsafe.Pointer(&p.bufptr)))))
+	r, _, _ := purego.SyscallN(pcapNextExPtr,
+		uintptr(p.cptr),
+		uintptr(unsafe.Pointer(&p.pkthdr)),
+		uintptr(unsafe.Pointer(&p.bufptr)),
+	)
+	ret := pcapCint(r)
+	if ret > 1 {
+		ret = 1
+	}
+	return NextError(ret)
 }
 
 func (p *Handle) pcapDatalink() layers.LinkType {
-	return layers.LinkType(C.pcap_datalink(p.cptr))
+	ret, _, _ := purego.SyscallN(pcapDatalinkPtr, uintptr(p.cptr))
+	return layers.LinkType(ret)
 }
 
 func (p *Handle) pcapSetDatalink(dlt layers.LinkType) error {
-	if C.pcap_set_datalink(p.cptr, C.int(dlt)) < 0 {
+	ret, _, _ := purego.SyscallN(pcapSetDatalinkPtr, uintptr(p.cptr), uintptr(dlt))
+	if pcapCint(ret) < 0 {
 		return p.pcapGeterr()
 	}
 	return nil
 }
 
 func pcapDatalinkValToName(dlt int) string {
-	return C.GoString(C.pcap_datalink_val_to_name(C.int(dlt)))
+	err := LoadUnixPCAP()
+	if err != nil {
+		panic(err)
+	}
+	ret, _, _ := purego.SyscallN(pcapDatalinkValToNamePtr, uintptr(dlt))
+	return bytePtrToString(ret)
 }
 
 func pcapDatalinkValToDescription(dlt int) string {
-	return C.GoString(C.pcap_datalink_val_to_description(C.int(dlt)))
+	err := LoadUnixPCAP()
+	if err != nil {
+		panic(err)
+	}
+	ret, _, _ := purego.SyscallN(pcapDatalinkValToDescriptionPtr, uintptr(dlt))
+	return bytePtrToString(ret)
 }
 
 func pcapDatalinkNameToVal(name string) int {
-	cptr := C.CString(name)
-	defer C.free(unsafe.Pointer(cptr))
-	return int(C.pcap_datalink_name_to_val(cptr))
+	err := LoadUnixPCAP()
+	if err != nil {
+		return 0
+	}
+	cptr, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return 0
+	}
+	ret, _, _ := purego.SyscallN(pcapDatalinkNameToValPtr, uintptr(unsafe.Pointer(cptr)))
+	return int(pcapCint(ret))
 }
 
 func pcapLibVersion() string {
-	return C.GoString(C.pcap_lib_version())
+	err := LoadUnixPCAP()
+	if err != nil {
+		panic(err)
+	}
+	ret, _, _ := purego.SyscallN(pcapLibVersionPtr)
+	return bytePtrToString(ret)
 }
 
 func (p *Handle) isOpen() bool {
-	return p.cptr != nil
+	return p.cptr != 0
 }
 
 type pcapDevices struct {
-	all, cur *C.pcap_if_t
+	all, cur *pcapIf
 }
 
 func (p pcapDevices) free() {
-	C.pcap_freealldevs((*C.pcap_if_t)(p.all))
+	purego.SyscallN(pcapFreealldevsPtr, uintptr(unsafe.Pointer(p.all)))
 }
 
 func (p *pcapDevices) next() bool {
@@ -447,27 +523,27 @@ func (p *pcapDevices) next() bool {
 		}
 		return true
 	}
-	if p.cur.next == nil {
+	if p.cur.Next == nil {
 		return false
 	}
-	p.cur = p.cur.next
+	p.cur = p.cur.Next
 	return true
 }
 
 func (p pcapDevices) name() string {
-	return C.GoString(p.cur.name)
+	return bytePtrToString(uintptr(unsafe.Pointer(p.cur.Name)))
 }
 
 func (p pcapDevices) description() string {
-	return C.GoString(p.cur.description)
+	return bytePtrToString(uintptr(unsafe.Pointer(p.cur.Description)))
 }
 
 func (p pcapDevices) flags() uint32 {
-	return uint32(p.cur.flags)
+	return p.cur.Flags
 }
 
 type pcapAddresses struct {
-	all, cur *C.pcap_addr_t
+	all, cur *pcapAddr
 }
 
 func (p *pcapAddresses) next() bool {
@@ -478,71 +554,105 @@ func (p *pcapAddresses) next() bool {
 		}
 		return true
 	}
-	if p.cur.next == nil {
+	if p.cur.Next == nil {
 		return false
 	}
-	p.cur = p.cur.next
+	p.cur = p.cur.Next
 	return true
 }
 
 func (p pcapAddresses) addr() *syscall.RawSockaddr {
-	return (*syscall.RawSockaddr)(unsafe.Pointer(p.cur.addr))
+	return p.cur.Addr
 }
 
 func (p pcapAddresses) netmask() *syscall.RawSockaddr {
-	return (*syscall.RawSockaddr)(unsafe.Pointer(p.cur.netmask))
+	return p.cur.Netmask
 }
 
 func (p pcapAddresses) broadaddr() *syscall.RawSockaddr {
-	return (*syscall.RawSockaddr)(unsafe.Pointer(p.cur.broadaddr))
+	return p.cur.Broadaddr
 }
 
 func (p pcapAddresses) dstaddr() *syscall.RawSockaddr {
-	return (*syscall.RawSockaddr)(unsafe.Pointer(p.cur.dstaddr))
+	return p.cur.Dstaddr
 }
 
 func (p pcapDevices) addresses() pcapAddresses {
-	return pcapAddresses{all: p.cur.addresses}
+	return pcapAddresses{all: p.cur.Addresses}
 }
 
 func pcapFindAllDevs() (pcapDevices, error) {
-	var buf *C.char
-	buf = (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(buf))
 	var alldevsp pcapDevices
+	err := LoadUnixPCAP()
+	if err != nil {
+		return alldevsp, err
+	}
 
-	if C.pcap_findalldevs((**C.pcap_if_t)(&alldevsp.all), buf) < 0 {
-		return pcapDevices{}, errors.New(C.GoString(buf))
+	buf := make([]byte, errorBufferSize)
+
+	ret, _, _ := purego.SyscallN(pcapFindalldevsPtr,
+		uintptr(unsafe.Pointer(&alldevsp.all)),
+		uintptr(unsafe.Pointer(&buf[0])),
+	)
+	if pcapCint(ret) < 0 {
+		return pcapDevices{}, errors.New(byteSliceToString(buf))
 	}
 	return alldevsp, nil
 }
 
 func (p *Handle) pcapSendpacket(data []byte) error {
-	if C.pcap_sendpacket(p.cptr, (*C.u_char)(&data[0]), (C.int)(len(data))) < 0 {
+	ret, _, _ := purego.SyscallN(pcapSendpacketPtr,
+		uintptr(p.cptr),
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)),
+	)
+	if pcapCint(ret) < 0 {
 		return p.pcapGeterr()
 	}
 	return nil
 }
 
 func (p *Handle) pcapSetdirection(direction Direction) error {
-	if status := C.pcap_setdirection(p.cptr, (C.pcap_direction_t)(direction)); status < 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetdirectionPtr, uintptr(p.cptr), uintptr(direction))
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *Handle) pcapSnapshot() int {
-	return int(C.pcap_snapshot(p.cptr))
+	ret, _, _ := purego.SyscallN(pcapSnapshotPtr, uintptr(p.cptr))
+	return int(pcapCint(ret))
 }
 
 func (t TimestampSource) pcapTstampTypeValToName() string {
-	return C.GoString(C.pcap_tstamp_type_val_to_name(C.int(t)))
+	err := LoadUnixPCAP()
+	if err != nil {
+		return err.Error()
+	}
+
+	if pcapTstampTypeValToNamePtr == 0 {
+		return "pcap timestamp types not supported"
+	}
+	ret, _, _ := purego.SyscallN(pcapTstampTypeValToNamePtr, uintptr(t))
+	return bytePtrToString(ret)
 }
 
 func pcapTstampTypeNameToVal(s string) (TimestampSource, error) {
-	cs := C.CString(s)
-	defer C.free(unsafe.Pointer(cs))
-	t := C.pcap_tstamp_type_name_to_val(cs)
+	err := LoadUnixPCAP()
+	if err != nil {
+		return 0, err
+	}
+
+	if pcapTstampTypeNameToValPtr == 0 {
+		return 0, statusError(pcapCint(pcapError))
+	}
+	cs, err := syscall.BytePtrFromString(s)
+	if err != nil {
+		return 0, err
+	}
+	ret, _, _ := purego.SyscallN(pcapTstampTypeNameToValPtr, uintptr(unsafe.Pointer(cs)))
+	t := pcapCint(ret)
 	if t < 0 {
 		return 0, statusError(t)
 	}
@@ -550,73 +660,91 @@ func pcapTstampTypeNameToVal(s string) (TimestampSource, error) {
 }
 
 func (p *InactiveHandle) pcapGeterr() error {
-	return errors.New(C.GoString(C.pcap_geterr(p.cptr)))
+	ret, _, _ := purego.SyscallN(pcapGeterrPtr, uintptr(p.cptr))
+	return errors.New(bytePtrToString(ret))
 }
 
 func (p *InactiveHandle) pcapActivate() (*Handle, activateError) {
-	ret := activateError(C.pcap_activate(p.cptr))
+	r, _, _ := purego.SyscallN(pcapActivatePtr, uintptr(p.cptr))
+	ret := activateError(pcapCint(r))
 	if ret != aeNoError {
 		return nil, ret
 	}
 	h := &Handle{
 		cptr: p.cptr,
 	}
-	p.cptr = nil
+	p.cptr = 0
 	return h, ret
 }
 
 func (p *InactiveHandle) pcapClose() {
-	if p.cptr != nil {
-		C.pcap_close(p.cptr)
+	if p.cptr != 0 {
+		purego.SyscallN(pcapClosePtr, uintptr(p.cptr))
 	}
+	p.cptr = 0
 }
 
 func pcapCreate(device string) (*InactiveHandle, error) {
-	buf := (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(buf))
-	dev := C.CString(device)
-	defer C.free(unsafe.Pointer(dev))
-
-	cptr := C.pcap_create(dev, buf)
-	if cptr == nil {
-		return nil, errors.New(C.GoString(buf))
+	err := LoadUnixPCAP()
+	if err != nil {
+		return nil, err
 	}
-	return &InactiveHandle{cptr: cptr}, nil
+
+	buf := make([]byte, errorBufferSize)
+	dev, err := syscall.BytePtrFromString(device)
+	if err != nil {
+		return nil, err
+	}
+	cptr, _, _ := purego.SyscallN(pcapCreatePtr,
+		uintptr(unsafe.Pointer(dev)),
+		uintptr(unsafe.Pointer(&buf[0])),
+	)
+	if cptr == 0 {
+		return nil, errors.New(byteSliceToString(buf))
+	}
+	return &InactiveHandle{cptr: pcapTPtr(cptr)}, nil
 }
 
 func (p *InactiveHandle) pcapSetSnaplen(snaplen int) error {
-	if status := C.pcap_set_snaplen(p.cptr, C.int(snaplen)); status < 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetSnaplenPtr, uintptr(p.cptr), uintptr(snaplen))
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *InactiveHandle) pcapSetPromisc(promisc bool) error {
-	var pro C.int
+	var pro uintptr
 	if promisc {
 		pro = 1
 	}
-	if status := C.pcap_set_promisc(p.cptr, pro); status < 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetPromiscPtr, uintptr(p.cptr), pro)
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *InactiveHandle) pcapSetTimeout(timeout time.Duration) error {
-	if status := C.pcap_set_timeout(p.cptr, C.int(timeoutMillis(timeout))); status < 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetTimeoutPtr, uintptr(p.cptr), uintptr(timeoutMillis(timeout)))
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *InactiveHandle) pcapListTstampTypes() (out []TimestampSource) {
-	var types *C.int
-	n := int(C.pcap_list_tstamp_types(p.cptr, &types))
-	if n < 0 {
-		return // public interface doesn't have error :(
+	if pcapListTstampTypesPtr == 0 {
+		return
 	}
-	defer C.pcap_free_tstamp_types(types)
-	typesArray := (*[1 << 28]C.int)(unsafe.Pointer(types))
+	var types *pcapCint
+	ret, _, _ := purego.SyscallN(pcapListTstampTypesPtr, uintptr(p.cptr), uintptr(unsafe.Pointer(&types)))
+	n := int(pcapCint(ret))
+	if n < 0 {
+		return
+	}
+	defer purego.SyscallN(pcapFreeTstampTypesPtr, uintptr(unsafe.Pointer(types)))
+	typesArray := (*[1 << 28]pcapCint)(unsafe.Pointer(types))
 	for i := 0; i < n; i++ {
 		out = append(out, TimestampSource((*typesArray)[i]))
 	}
@@ -624,57 +752,73 @@ func (p *InactiveHandle) pcapListTstampTypes() (out []TimestampSource) {
 }
 
 func (p *InactiveHandle) pcapSetTstampType(t TimestampSource) error {
-	if status := C.pcap_set_tstamp_type(p.cptr, C.int(t)); status < 0 {
-		return statusError(status)
+	if pcapSetTstampTypePtr == 0 {
+		return statusError(pcapError)
+	}
+	status, _, _ := purego.SyscallN(pcapSetTstampTypePtr, uintptr(p.cptr), uintptr(t))
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *InactiveHandle) pcapSetRfmon(monitor bool) error {
-	var mon C.int
+	if pcapCanSetRfmonPtr == 0 {
+		return CannotSetRFMon
+	}
+	var mon uintptr
 	if monitor {
 		mon = 1
 	}
-	switch canset := C.pcap_can_set_rfmon(p.cptr); canset {
+	canset, _, _ := purego.SyscallN(pcapCanSetRfmonPtr, uintptr(p.cptr))
+	switch canset {
 	case 0:
 		return CannotSetRFMon
 	case 1:
 		// success
 	default:
-		return statusError(canset)
+		return statusError(pcapCint(canset))
 	}
-	if status := C.pcap_set_rfmon(p.cptr, mon); status != 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetRfmonPtr, uintptr(p.cptr), mon)
+	if status != 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *InactiveHandle) pcapSetBufferSize(bufferSize int) error {
-	if status := C.pcap_set_buffer_size(p.cptr, C.int(bufferSize)); status < 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetBufferSizePtr, uintptr(p.cptr), uintptr(bufferSize))
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *InactiveHandle) pcapSetImmediateMode(mode bool) error {
-	var md C.int
+	if pcapSetImmediateModePtr == 0 {
+		return statusError(pcapError)
+	}
+	var md uintptr
 	if mode {
 		md = 1
 	}
-	if status := C.pcap_set_immediate_mode(p.cptr, md); status < 0 {
-		return statusError(status)
+	status, _, _ := purego.SyscallN(pcapSetImmediateModePtr, uintptr(p.cptr), md)
+	if pcapCint(status) < 0 {
+		return statusError(pcapCint(status))
 	}
 	return nil
 }
 
 func (p *Handle) setNonBlocking() error {
-	buf := (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(buf))
+	buf := make([]byte, errorBufferSize)
 
-	// Change the device to non-blocking, we'll use pcap_wait to wait until the
-	// handle is ready to read.
-	if v := C.pcap_setnonblock(p.cptr, 1, buf); v < -1 {
-		return errors.New(C.GoString(buf))
+	v, _, _ := purego.SyscallN(pcapSetNonBlockPtr,
+		uintptr(p.cptr),
+		uintptr(1),
+		uintptr(unsafe.Pointer(&buf[0])),
+	)
+	if int32(v) < -1 {
+		return errors.New(byteSliceToString(buf))
 	}
 
 	return nil
@@ -682,26 +826,21 @@ func (p *Handle) setNonBlocking() error {
 
 // waitForPacket waits for a packet or for the timeout to expire.
 func (p *Handle) waitForPacket() {
-	// According to pcap_get_selectable_fd() man page, there are some cases where it will
-	// return a file descriptor, but a simple call of select() or poll() will not indicate
-	// that the descriptor is readable until a full buffer's worth of packets is received,
-	// so the call must have a timeout less than *or equal* to the packet buffer timeout.
-	// The packet buffer timeout is set to timeoutMillis(p.timeout) in pcapOpenLive(),
-	// so we should be fine to use it here too.
-	C.pcap_wait(p.cptr, C.int(timeoutMillis(p.timeout)))
+	fdRet, _, _ := purego.SyscallN(pcapGetSelectableFdPtr, uintptr(p.cptr))
+	fd := int32(fdRet)
+	if fd < 0 {
+		return
+	}
+
+	tmMs := timeoutMillis(p.timeout)
+	if tmMs == 0 {
+		tmMs = -1
+	}
+	fds := []unix.PollFd{{Fd: fd, Events: unix.POLLIN}}
+	unix.Poll(fds, tmMs)
 }
 
 // openOfflineFile returns contents of input file as a *Handle.
 func openOfflineFile(file *os.File) (handle *Handle, err error) {
-	buf := (*C.char)(C.calloc(errorBufferSize, 1))
-	defer C.free(unsafe.Pointer(buf))
-	cmode := C.CString("rb")
-	defer C.free(unsafe.Pointer(cmode))
-	cf := C.fdopen(C.int(file.Fd()), cmode)
-
-	cptr := C.pcap_fopen_offline_with_tstamp_precision(cf, C.PCAP_TSTAMP_PRECISION_NANO, buf)
-	if cptr == nil {
-		return nil, errors.New(C.GoString(buf))
-	}
-	return &Handle{cptr: cptr}, nil
+	return openOffline(fmt.Sprintf("/dev/fd/%d", file.Fd()))
 }

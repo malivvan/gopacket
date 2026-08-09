@@ -8,7 +8,7 @@ package layers
 import (
 	"fmt"
 
-	"github.com/google/gopacket"
+	"github.com/malivvan/gopacket"
 )
 
 func init() {

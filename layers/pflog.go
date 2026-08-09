@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/gopacket"
+	"github.com/malivvan/gopacket"
 )
 
 type PFDirection uint8

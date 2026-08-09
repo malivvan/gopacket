@@ -11,7 +11,7 @@ package layers
 import (
 	"testing"
 
-	"github.com/google/gopacket"
+	"github.com/malivvan/gopacket"
 )
 
 func checkLayers(p gopacket.Packet, want []gopacket.LayerType, t *testing.T) {

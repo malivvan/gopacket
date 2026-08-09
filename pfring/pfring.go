@@ -7,75 +7,116 @@
 
 package pfring
 
-/*
-// lpcap is needed for bpf
-#cgo LDFLAGS: -lpfring -lpcap
-#include <stdlib.h>
-#include <pfring.h>
-#include <stdint.h>
-#include <linux/pf_ring.h>
-
-struct metadata {
-	u_int64_t timestamp_ns;
-	u_int32_t caplen;
-	u_int32_t len;
-	int32_t if_index;
-};
-
-// In pfring 7.2 pfring_pkthdr struct was changed to packed
-// Since this is incompatible with go, copy the values we need to a custom
-// struct (struct metadata above).
-// Another way to do this, would be to store the struct offsets in defines
-// and use encoding/binary in go-land. But this has the downside, that there is
-// no native endianess in encoding/binary and storing ByteOrder in a variable
-// leads to an expensive itab lookup + call (instead of very fast inlined and
-// optimized movs). Using unsafe magic could lead to problems with unaligned
-// access.
-// Additionally, this does the same uintptr-dance as pcap.
-int pfring_readpacketdatato_wrapper(
-    pfring* ring,
-    uintptr_t buffer,
-    uintptr_t meta) {
-  struct metadata* ci = (struct metadata* )meta;
-  struct pfring_pkthdr hdr;
-  int ret = pfring_recv(ring, (u_char**)buffer, 0, &hdr, 1);
-  ci->timestamp_ns = hdr.extended_hdr.timestamp_ns;
-  ci->caplen = hdr.caplen;
-  ci->len = hdr.len;
-  ci->if_index = hdr.extended_hdr.if_index;
-  return ret;
-}
-*/
-import "C"
-
-// NOTE:  If you install PF_RING with non-standard options, you may also need
-// to use LDFLAGS -lnuma and/or -lrt.  Both have been reported necessary if
-// PF_RING is configured with --disable-bpf.
-
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
 	"reflect"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/google/gopacket"
+	"github.com/ebitengine/purego"
+	"github.com/malivvan/gopacket"
 )
 
 const errorBufferSize = 256
 
+var pfringLoaded = false
+
+var (
+	pfringHandle  uintptr
+	pfringLoadErr error
+)
+
+var (
+	pfringOpenPtr,
+	pfringClosePtr,
+	pfringRecvPtr,
+	pfringSetClusterPtr,
+	pfringRemoveFromClusterPtr,
+	pfringSetSamplingRatePtr,
+	pfringSetPollWatermarkPtr,
+	pfringConfigPtr,
+	pfringSetPollDurationPtr,
+	pfringSetBpfFilterPtr,
+	pfringRemoveBpfFilterPtr,
+	pfringSendPtr,
+	pfringEnableRingPtr,
+	pfringDisableRingPtr,
+	pfringStatsPtr,
+	pfringSetDirectionPtr,
+	pfringSetSocketModePtr,
+	pfringSetApplicationNamePtr uintptr
+)
+
+func init() {
+	loadPFRing()
+}
+
+func loadPFRing() error {
+	if pfringLoaded {
+		return pfringLoadErr
+	}
+
+	names := []string{
+		"libpfring.so.1",
+		"libpfring.so",
+	}
+	for _, name := range names {
+		pfringHandle, pfringLoadErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		if pfringLoadErr == nil {
+			break
+		}
+	}
+	if pfringLoadErr != nil {
+		pfringLoadErr = fmt.Errorf("couldn't load libpfring: %w", pfringLoadErr)
+		pfringLoaded = true
+		return pfringLoadErr
+	}
+
+	pfringOpenPtr = mustLoadPfring("pfring_open")
+	pfringClosePtr = mustLoadPfring("pfring_close")
+	pfringRecvPtr = mustLoadPfring("pfring_recv")
+	pfringSetClusterPtr = mustLoadPfring("pfring_set_cluster")
+	pfringRemoveFromClusterPtr = mustLoadPfring("pfring_remove_from_cluster")
+	pfringSetSamplingRatePtr = mustLoadPfring("pfring_set_sampling_rate")
+	pfringSetPollWatermarkPtr = mustLoadPfring("pfring_set_poll_watermark")
+	pfringConfigPtr = mustLoadPfring("pfring_config")
+	pfringSetPollDurationPtr = mustLoadPfring("pfring_set_poll_duration")
+	pfringSetBpfFilterPtr = mustLoadPfring("pfring_set_bpf_filter")
+	pfringRemoveBpfFilterPtr = mustLoadPfring("pfring_remove_bpf_filter")
+	pfringSendPtr = mustLoadPfring("pfring_send")
+	pfringEnableRingPtr = mustLoadPfring("pfring_enable_ring")
+	pfringDisableRingPtr = mustLoadPfring("pfring_disable_ring")
+	pfringStatsPtr = mustLoadPfring("pfring_stats")
+	pfringSetDirectionPtr = mustLoadPfring("pfring_set_direction")
+	pfringSetSocketModePtr = mustLoadPfring("pfring_set_socket_mode")
+	pfringSetApplicationNamePtr = mustLoadPfring("pfring_set_application_name")
+
+	pfringLoaded = true
+	return nil
+}
+
+func mustLoadPfring(name string) uintptr {
+	sym, err := purego.Dlsym(pfringHandle, name)
+	if err != nil {
+		panic(fmt.Sprintf("couldn't load function %s from libpfring: %v", name, err))
+	}
+	return sym
+}
+
 // Ring provides a handle to a pf_ring.
 type Ring struct {
-	cptr                    *C.pfring
+	cptr                    uintptr
 	useExtendedPacketHeader bool
 	interfaceIndex          int
 	mu                      sync.Mutex
 
-	meta   C.struct_metadata
-	bufPtr *C.u_char
+	bufPtr *uint8
 }
 
 // Flag provides a set of boolean flags to use when creating a new ring.
@@ -83,24 +124,34 @@ type Flag uint32
 
 // Set of flags that can be passed (OR'd together) to NewRing.
 const (
-	FlagReentrant       Flag = C.PF_RING_REENTRANT
-	FlagLongHeader      Flag = C.PF_RING_LONG_HEADER
-	FlagPromisc         Flag = C.PF_RING_PROMISC
-	FlagDNASymmetricRSS Flag = C.PF_RING_DNA_SYMMETRIC_RSS
-	FlagTimestamp       Flag = C.PF_RING_TIMESTAMP
-	FlagHWTimestamp     Flag = C.PF_RING_HW_TIMESTAMP
+	FlagReentrant       Flag = flagReentrant
+	FlagLongHeader      Flag = flagLongHeader
+	FlagPromisc         Flag = flagPromisc
+	FlagDNASymmetricRSS Flag = flagDNASymmetricRSS
+	FlagTimestamp       Flag = flagTimestamp
+	FlagHWTimestamp     Flag = flagHWTimestamp
 )
 
 // NewRing creates a new PFRing.  Note that when the ring is initially created,
 // it is disabled.  The caller must call Enable to start receiving packets.
 // The caller should call Close on the given ring when finished with it.
 func NewRing(device string, snaplen uint32, flags Flag) (ring *Ring, _ error) {
-	dev := C.CString(device)
-	defer C.free(unsafe.Pointer(dev))
+	if err := loadPFRing(); err != nil {
+		return nil, err
+	}
 
-	cptr, err := C.pfring_open(dev, C.u_int32_t(snaplen), C.u_int32_t(flags))
-	if cptr == nil || err != nil {
-		return nil, fmt.Errorf("pfring NewRing error: %v", err)
+	dev, err := syscall.BytePtrFromString(device)
+	if err != nil {
+		return nil, err
+	}
+
+	cptr, _, _ := purego.SyscallN(pfringOpenPtr,
+		uintptr(unsafe.Pointer(dev)),
+		uintptr(snaplen),
+		uintptr(flags),
+	)
+	if cptr == 0 {
+		return nil, fmt.Errorf("pfring NewRing error: pfring_open returned nil")
 	}
 	ring = &Ring{cptr: cptr}
 
@@ -119,7 +170,7 @@ func NewRing(device string, snaplen uint32, flags Flag) (ring *Ring, _ error) {
 // Close closes the given Ring.  After this call, the Ring should no longer be
 // used.
 func (r *Ring) Close() {
-	C.pfring_close(r.cptr)
+	purego.SyscallN(pfringClosePtr, r.cptr)
 }
 
 // NextResult is the return code from a call to Next.
@@ -148,17 +199,27 @@ func (n NextResult) Error() string {
 	return strconv.Itoa(int(n))
 }
 
-// shared code (Read-functions), that fetches a packet + metadata from pf_ring
+// getNextBufPtrLocked fetches a packet + metadata from pf_ring.
+// It calls pfring_recv directly and parses the packed pfring_pkthdr at
+// known byte offsets, replacing the old C wrapper that existed to handle
+// the packed struct incompatibility with Go.
 func (r *Ring) getNextBufPtrLocked(ci *gopacket.CaptureInfo) error {
-	result := NextResult(C.pfring_readpacketdatato_wrapper(r.cptr, C.uintptr_t(uintptr(unsafe.Pointer(&r.bufPtr))), C.uintptr_t(uintptr(unsafe.Pointer(&r.meta)))))
-	if result != NextOk {
-		return result
+	var hdr [pfringPkthdrBufSize]byte
+	result, _, _ := purego.SyscallN(pfringRecvPtr,
+		r.cptr,
+		uintptr(unsafe.Pointer(&r.bufPtr)),
+		0,
+		uintptr(unsafe.Pointer(&hdr[0])),
+		1,
+	)
+	if NextResult(int32(result)) != NextOk {
+		return NextResult(int32(result))
 	}
-	ci.Timestamp = time.Unix(0, int64(r.meta.timestamp_ns))
-	ci.CaptureLength = int(r.meta.caplen)
-	ci.Length = int(r.meta.len)
+	ci.Timestamp = time.Unix(0, int64(binary.NativeEndian.Uint64(hdr[offsetTsNs:])))
+	ci.CaptureLength = int(binary.NativeEndian.Uint32(hdr[offsetCaplen:]))
+	ci.Length = int(binary.NativeEndian.Uint32(hdr[offsetLen:]))
 	if r.useExtendedPacketHeader {
-		ci.InterfaceIndex = int(r.meta.if_index)
+		ci.InterfaceIndex = int(int32(binary.NativeEndian.Uint32(hdr[offsetIfIndex:])))
 	} else {
 		ci.InterfaceIndex = r.interfaceIndex
 	}
@@ -192,7 +253,8 @@ func (r *Ring) ReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error
 	r.mu.Lock()
 	err = r.getNextBufPtrLocked(&ci)
 	if err == nil {
-		data = C.GoBytes(unsafe.Pointer(r.bufPtr), C.int(ci.CaptureLength))
+		data = make([]byte, ci.CaptureLength)
+		copy(data, unsafe.Slice(r.bufPtr, ci.CaptureLength))
 	}
 	r.mu.Unlock()
 	return
@@ -206,9 +268,10 @@ func (r *Ring) ReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error
 // to old bytes when using ZeroCopyReadPacketData... if you need to keep data past
 // the next time you call ZeroCopyReadPacketData, use ReadPacketData, which copies
 // the bytes into a new buffer for you.
-//  data1, _, _ := handle.ZeroCopyReadPacketData()
-//  // do everything you want with data1 here, copying bytes out of it if you'd like to keep them around.
-//  data2, _, _ := handle.ZeroCopyReadPacketData()  // invalidates bytes in data1
+//
+//	data1, _, _ := handle.ZeroCopyReadPacketData()
+//	// do everything you want with data1 here, copying bytes out of it if you'd like to keep them around.
+//	data2, _, _ := handle.ZeroCopyReadPacketData()  // invalidates bytes in data1
 func (r *Ring) ZeroCopyReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
 	r.mu.Lock()
 	err = r.getNextBufPtrLocked(&ci)
@@ -224,32 +287,33 @@ func (r *Ring) ZeroCopyReadPacketData() (data []byte, ci gopacket.CaptureInfo, e
 
 // ClusterType is a type of clustering used when balancing across multiple
 // rings.
-type ClusterType C.cluster_type
+type ClusterType int32
 
 const (
 	// ClusterPerFlow clusters by <src ip, src port, dst ip, dst port, proto,
 	// vlan>
-	ClusterPerFlow ClusterType = C.cluster_per_flow
+	ClusterPerFlow ClusterType = clusterPerFlow
 	// ClusterRoundRobin round-robins packets between applications, ignoring
 	// packet information.
-	ClusterRoundRobin ClusterType = C.cluster_round_robin
+	ClusterRoundRobin ClusterType = clusterRoundRobin
 	// ClusterPerFlow2Tuple clusters by <src ip, dst ip>
-	ClusterPerFlow2Tuple ClusterType = C.cluster_per_flow_2_tuple
+	ClusterPerFlow2Tuple ClusterType = clusterPerFlow2Tuple
 	// ClusterPerFlow4Tuple clusters by <src ip, src port, dst ip, dst port>
-	ClusterPerFlow4Tuple ClusterType = C.cluster_per_flow_4_tuple
+	ClusterPerFlow4Tuple ClusterType = clusterPerFlow4Tuple
 	// ClusterPerFlow5Tuple clusters by <src ip, src port, dst ip, dst port,
 	// proto>
-	ClusterPerFlow5Tuple ClusterType = C.cluster_per_flow_5_tuple
+	ClusterPerFlow5Tuple ClusterType = clusterPerFlow5Tuple
 	// ClusterPerFlowTCP5Tuple acts like ClusterPerFlow5Tuple for TCP packets and
 	// like ClusterPerFlow2Tuple for all other packets.
-	ClusterPerFlowTCP5Tuple ClusterType = C.cluster_per_flow_tcp_5_tuple
+	ClusterPerFlowTCP5Tuple ClusterType = clusterPerFlowTCP5Tuple
 )
 
 // SetCluster sets which cluster the ring should be part of, and the cluster
 // type to use.
 func (r *Ring) SetCluster(cluster int, typ ClusterType) error {
-	if rv := C.pfring_set_cluster(r.cptr, C.u_int(cluster), C.cluster_type(typ)); rv != 0 {
-		return fmt.Errorf("Unable to set cluster, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSetClusterPtr, r.cptr, uintptr(cluster), uintptr(typ))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set cluster, got error code %d", int32(rv))
 	}
 	return nil
 }
@@ -257,64 +321,77 @@ func (r *Ring) SetCluster(cluster int, typ ClusterType) error {
 // RemoveFromCluster removes the ring from the cluster it was put in with
 // SetCluster.
 func (r *Ring) RemoveFromCluster() error {
-	if rv := C.pfring_remove_from_cluster(r.cptr); rv != 0 {
-		return fmt.Errorf("Unable to remove from cluster, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringRemoveFromClusterPtr, r.cptr)
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to remove from cluster, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // SetSamplingRate sets the sampling rate to 1/<rate>.
 func (r *Ring) SetSamplingRate(rate int) error {
-	if rv := C.pfring_set_sampling_rate(r.cptr, C.u_int32_t(rate)); rv != 0 {
-		return fmt.Errorf("Unable to set sampling rate, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSetSamplingRatePtr, r.cptr, uintptr(rate))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set sampling rate, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // SetPollWatermark sets the pfring's poll watermark packet count
 func (r *Ring) SetPollWatermark(count uint16) error {
-	if rv := C.pfring_set_poll_watermark(r.cptr, C.u_int16_t(count)); rv != 0 {
-		return fmt.Errorf("Unable to set poll watermark, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSetPollWatermarkPtr, r.cptr, uintptr(count))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set poll watermark, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // SetPriority sets the pfring poll threads CPU usage limit
 func (r *Ring) SetPriority(cpu uint16) {
-	C.pfring_config(C.u_short(cpu))
+	purego.SyscallN(pfringConfigPtr, uintptr(cpu))
 }
 
 // SetPollDuration sets the pfring's poll duration before it yields/returns
 func (r *Ring) SetPollDuration(durationMillis uint) error {
-	if rv := C.pfring_set_poll_duration(r.cptr, C.u_int(durationMillis)); rv != 0 {
-		return fmt.Errorf("Unable to set poll duration, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSetPollDurationPtr, r.cptr, uintptr(durationMillis))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set poll duration, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // SetBPFFilter sets the BPF filter for the ring.
 func (r *Ring) SetBPFFilter(bpfFilter string) error {
-	filter := C.CString(bpfFilter)
-	defer C.free(unsafe.Pointer(filter))
-	if rv := C.pfring_set_bpf_filter(r.cptr, filter); rv != 0 {
-		return fmt.Errorf("Unable to set BPF filter, got error code %d", rv)
+	filter, err := syscall.BytePtrFromString(bpfFilter)
+	if err != nil {
+		return err
+	}
+	rv, _, _ := purego.SyscallN(pfringSetBpfFilterPtr, r.cptr, uintptr(unsafe.Pointer(filter)))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set BPF filter, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // RemoveBPFFilter removes the BPF filter from the ring.
 func (r *Ring) RemoveBPFFilter() error {
-	if rv := C.pfring_remove_bpf_filter(r.cptr); rv != 0 {
-		return fmt.Errorf("Unable to remove BPF filter, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringRemoveBpfFilterPtr, r.cptr)
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to remove BPF filter, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // WritePacketData uses the ring to send raw packet data to the interface.
 func (r *Ring) WritePacketData(data []byte) error {
-	buf := (*C.char)(unsafe.Pointer(&data[0]))
-	if rv := C.pfring_send(r.cptr, buf, C.u_int(len(data)), 1); rv < 0 {
-		return fmt.Errorf("Unable to send packet data, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSendPtr,
+		r.cptr,
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)),
+		1,
+	)
+	if int32(rv) < 0 {
+		return fmt.Errorf("Unable to send packet data, got error code %d", int32(rv))
 	}
 	return nil
 }
@@ -322,8 +399,9 @@ func (r *Ring) WritePacketData(data []byte) error {
 // Enable enables the given ring.  This function MUST be called on each new
 // ring after it has been set up, or that ring will NOT receive packets.
 func (r *Ring) Enable() error {
-	if rv := C.pfring_enable_ring(r.cptr); rv != 0 {
-		return fmt.Errorf("Unable to enable ring, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringEnableRingPtr, r.cptr)
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to enable ring, got error code %d", int32(rv))
 	}
 	return nil
 }
@@ -331,8 +409,9 @@ func (r *Ring) Enable() error {
 // Disable disables the given ring.  After this call, it will no longer receive
 // packets.
 func (r *Ring) Disable() error {
-	if rv := C.pfring_disable_ring(r.cptr); rv != 0 {
-		return fmt.Errorf("Unable to disable ring, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringDisableRingPtr, r.cptr)
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to disable ring, got error code %d", int32(rv))
 	}
 	return nil
 }
@@ -344,57 +423,60 @@ type Stats struct {
 
 // Stats returns statistsics for the ring.
 func (r *Ring) Stats() (s Stats, err error) {
-	var stats C.pfring_stat
-	if rv := C.pfring_stats(r.cptr, &stats); rv != 0 {
-		err = fmt.Errorf("Unable to get ring stats, got error code %d", rv)
+	var stats pfringStats
+	rv, _, _ := purego.SyscallN(pfringStatsPtr, r.cptr, uintptr(unsafe.Pointer(&stats)))
+	if int32(rv) != 0 {
+		err = fmt.Errorf("Unable to get ring stats, got error code %d", int32(rv))
 		return
 	}
-	s.Received = uint64(stats.recv)
-	s.Dropped = uint64(stats.drop)
+	s.Received = stats.Recv
+	s.Dropped = stats.Drop
 	return
 }
 
 // Direction is a simple enum to set which packets (TX, RX, or both) a ring
 // captures.
-type Direction C.packet_direction
+type Direction int32
 
 const (
 	// TransmitOnly will only capture packets transmitted by the ring's
 	// interface(s).
-	TransmitOnly Direction = C.tx_only_direction
+	TransmitOnly Direction = txOnlyDirection
 	// ReceiveOnly will only capture packets received by the ring's
 	// interface(s).
-	ReceiveOnly Direction = C.rx_only_direction
+	ReceiveOnly Direction = rxOnlyDirection
 	// ReceiveAndTransmit will capture both received and transmitted packets on
 	// the ring's interface(s).
-	ReceiveAndTransmit Direction = C.rx_and_tx_direction
+	ReceiveAndTransmit Direction = rxAndTxDirection
 )
 
 // SetDirection sets which packets should be captured by the ring.
 func (r *Ring) SetDirection(d Direction) error {
-	if rv := C.pfring_set_direction(r.cptr, C.packet_direction(d)); rv != 0 {
-		return fmt.Errorf("Unable to set ring direction, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSetDirectionPtr, r.cptr, uintptr(d))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set ring direction, got error code %d", int32(rv))
 	}
 	return nil
 }
 
 // SocketMode is an enum for setting whether a ring should read, write, or both.
-type SocketMode C.socket_mode
+type SocketMode int32
 
 const (
 	// WriteOnly sets up the ring to only send packets (Inject), not read them.
-	WriteOnly SocketMode = C.send_only_mode
+	WriteOnly SocketMode = sendOnlyMode
 	// ReadOnly sets up the ring to only receive packets (ReadPacketData), not
 	// send them.
-	ReadOnly SocketMode = C.recv_only_mode
+	ReadOnly SocketMode = recvOnlyMode
 	// WriteAndRead sets up the ring to both send and receive packets.
-	WriteAndRead SocketMode = C.send_and_recv_mode
+	WriteAndRead SocketMode = sendAndRecvMode
 )
 
 // SetSocketMode sets the mode of the ring socket to send, receive, or both.
 func (r *Ring) SetSocketMode(s SocketMode) error {
-	if rv := C.pfring_set_socket_mode(r.cptr, C.socket_mode(s)); rv != 0 {
-		return fmt.Errorf("Unable to set socket mode, got error code %d", rv)
+	rv, _, _ := purego.SyscallN(pfringSetSocketModePtr, r.cptr, uintptr(s))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set socket mode, got error code %d", int32(rv))
 	}
 	return nil
 }
@@ -403,10 +485,13 @@ func (r *Ring) SetSocketMode(s SocketMode) error {
 // /proc stats for pf_ring.  By default, NewRing automatically calls this with
 // argv[0].
 func (r *Ring) SetApplicationName(name string) error {
-	buf := C.CString(name)
-	defer C.free(unsafe.Pointer(buf))
-	if rv := C.pfring_set_application_name(r.cptr, buf); rv != 0 {
-		return fmt.Errorf("Unable to set ring application name, got error code %d", rv)
+	buf, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	rv, _, _ := purego.SyscallN(pfringSetApplicationNamePtr, r.cptr, uintptr(unsafe.Pointer(buf)))
+	if int32(rv) != 0 {
+		return fmt.Errorf("Unable to set ring application name, got error code %d", int32(rv))
 	}
 	return nil
 }
