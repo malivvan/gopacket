@@ -1,6 +1,6 @@
 module github.com/malivvan/gopacket
 
-go 1.24.0
+go 1.26.5
 
 require (
 	github.com/vishvananda/netlink v1.1.0
@@ -9,4 +9,4 @@ require (
 	golang.org/x/sys v0.41.0
 )
 
-require github.com/ebitengine/purego v0.10.0
+require github.com/ebitengine/purego v0.10.2

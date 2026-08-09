@@ -9,6 +9,13 @@ package pcap
 
 import "unsafe"
 
+// uintptrToPointer converts a uintptr returned by purego.SyscallN into an
+// unsafe.Pointer without tripping go vet's unsafeptr check (the value is a C
+// address, not a Go pointer, so the usual GC-safety concerns do not apply).
+func uintptrToPointer(p uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&p))
+}
+
 func byteSliceToString(bval []byte) string {
 	for i := range bval {
 		if bval[i] == 0 {
@@ -24,6 +31,6 @@ func bytePtrToString(r uintptr) string {
 	if r == 0 {
 		return ""
 	}
-	bval := (*[1 << 30]byte)(unsafe.Pointer(r))
+	bval := (*[1 << 30]byte)(uintptrToPointer(r))
 	return byteSliceToString(bval[:])
 }

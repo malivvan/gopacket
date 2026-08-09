@@ -50,7 +50,8 @@ var (
 	pfringStatsPtr,
 	pfringSetDirectionPtr,
 	pfringSetSocketModePtr,
-	pfringSetApplicationNamePtr uintptr
+	pfringSetApplicationNamePtr,
+	pfringVersionNoringPtr uintptr
 )
 
 func init() {
@@ -96,6 +97,16 @@ func loadPFRing() error {
 	pfringSetDirectionPtr = mustLoadPfring("pfring_set_direction")
 	pfringSetSocketModePtr = mustLoadPfring("pfring_set_socket_mode")
 	pfringSetApplicationNamePtr = mustLoadPfring("pfring_set_application_name")
+
+	// The layout of pfring_extended_pkthdr changed in PF_RING 7.8.0
+	// (port_id/device_id fields were inserted before if_index), so pick the
+	// right field offsets based on the loaded library version.
+	pfringVersionNoringPtr, _ = purego.Dlsym(pfringHandle, "pfring_version_noring")
+	if pfringVersionNoringPtr != 0 {
+		var version uint32
+		purego.SyscallN(pfringVersionNoringPtr, uintptr(unsafe.Pointer(&version)))
+		setPkthdrOffsetsForVersion(version)
+	}
 
 	pfringLoaded = true
 	return nil

@@ -177,12 +177,10 @@ func (w *v3wrapper) next() bool {
 		return false
 	}
 
-	next := uintptr(unsafe.Pointer(w.packet))
-	if w.packet.Next_offset != 0 {
-		next += uintptr(w.packet.Next_offset)
-	} else {
-		next += uintptr(tpAlign(int(w.packet.Snaplen) + int(w.packet.Mac)))
+	nextOffset := uintptr(w.packet.Next_offset)
+	if nextOffset == 0 {
+		nextOffset = uintptr(tpAlign(int(w.packet.Snaplen) + int(w.packet.Mac)))
 	}
-	w.packet = (*tpacket3Hdr)(unsafe.Pointer(next))
+	w.packet = (*tpacket3Hdr)(unsafe.Pointer(uintptr(unsafe.Pointer(w.packet)) + nextOffset))
 	return true
 }

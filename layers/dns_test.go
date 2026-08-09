@@ -224,11 +224,11 @@ func TestParseDNSTypeURI(t *testing.T) {
 	}
 	priority := answers[0].URI.Priority
 	if priority != testParseDNSTypeURIPriority {
-		t.Errorf("Incorrect URI priority value, expected %q, got %q", testParseDNSTypeURIPriority, priority)
+		t.Errorf("Incorrect URI priority value, expected %d, got %d", testParseDNSTypeURIPriority, priority)
 	}
 	weight := answers[0].URI.Weight
 	if weight != testParseDNSTypeURIWeight {
-		t.Errorf("Incorrect URI weight value, expected %q, got %q", testParseDNSTypeURIWeight, weight)
+		t.Errorf("Incorrect URI weight value, expected %d, got %d", testParseDNSTypeURIWeight, weight)
 	}
 }
 

@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -84,6 +83,54 @@ var (
 
 func init() {
 	LoadUnixPCAP()
+}
+
+// libcMallocPtr holds the resolved malloc symbol from the C standard library.
+// It is used to allocate memory that libpcap will release with pcap_freecode
+// (which calls C's free()). Memory coming from the Go heap must never be handed
+// to C's free(), as that is undefined behavior.
+var (
+	libcAllocOnce sync.Once
+	libcAllocErr  error
+	libcMallocPtr uintptr
+)
+
+// loadLibcAllocators resolves malloc from the platform C library.
+func loadLibcAllocators() error {
+	libcAllocOnce.Do(func() {
+		names := []string{
+			// Linux (glibc/musl)
+			"libc.so.6",
+			"libc.so",
+			"libc.musl-x86_64.so.1",
+			"libc.musl-aarch64.so.1",
+			// macOS
+			"libSystem.B.dylib",
+			"libc.dylib",
+			// FreeBSD
+			"libc.so.7",
+			// NetBSD
+			"libc.so.12",
+			// OpenBSD
+			"libc.so.95",
+		}
+		var handle uintptr
+		for _, name := range names {
+			handle, libcAllocErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+			if libcAllocErr == nil {
+				break
+			}
+		}
+		if libcAllocErr != nil {
+			libcAllocErr = fmt.Errorf("couldn't load libc: %w", libcAllocErr)
+			return
+		}
+		libcMallocPtr, libcAllocErr = purego.Dlsym(handle, "malloc")
+		if libcAllocErr != nil {
+			libcAllocErr = fmt.Errorf("couldn't resolve malloc from libc: %w", libcAllocErr)
+		}
+	})
+	return libcAllocErr
 }
 
 // LoadUnixPCAP attempts to dynamically load the libpcap shared library and resolve necessary functions.
@@ -341,11 +388,26 @@ func (p pcapBpfProgram) toBPFInstruction() []BPFInstruction {
 	return bpfInstruction
 }
 
-func pcapBpfProgramFromInstructions(bpfInstructions []BPFInstruction) pcapBpfProgram {
+func pcapBpfProgramFromInstructions(bpfInstructions []BPFInstruction) (pcapBpfProgram, error) {
 	var bpf pcapBpfProgram
 	bpf.Len = uint32(len(bpfInstructions))
-	insns := make([]pcapBpfInstruction, len(bpfInstructions))
 
+	if err := loadLibcAllocators(); err != nil {
+		return bpf, err
+	}
+
+	// The instructions must live in memory allocated by C's malloc(): the
+	// resulting program is later released with pcap_freecode(), which frees
+	// bf_insns with C's free(). Calling free() on Go heap memory would corrupt
+	// the Go heap, so we allocate the buffer in libc and copy the instructions
+	// into it.
+	size := uintptr(len(bpfInstructions)) * unsafe.Sizeof(pcapBpfInstruction{})
+	cptr, _, _ := purego.SyscallN(libcMallocPtr, size)
+	if cptr == 0 {
+		return bpf, errors.New("malloc failed to allocate BPF instructions")
+	}
+
+	insns := unsafe.Slice((*pcapBpfInstruction)(uintptrToPointer(cptr)), len(bpfInstructions))
 	for i, v := range bpfInstructions {
 		insns[i].Code = v.Code
 		insns[i].Jt = v.Jt
@@ -353,9 +415,8 @@ func pcapBpfProgramFromInstructions(bpfInstructions []BPFInstruction) pcapBpfPro
 		insns[i].K = v.K
 	}
 
-	bpf.Insns = &insns[0]
-	runtime.KeepAlive(insns)
-	return bpf
+	bpf.Insns = (*pcapBpfInstruction)(uintptrToPointer(cptr))
+	return bpf, nil
 }
 
 func pcapLookupnet(device string) (netp, maskp uint32, err error) {

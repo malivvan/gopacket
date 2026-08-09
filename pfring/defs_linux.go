@@ -65,17 +65,45 @@ type pfringStats struct {
 //     u_int64_t   timestamp_ns;          //   8 bytes (offset 0)
 //     u_int32_t   flags;                 //   4 bytes (offset 8)
 //     u_int8_t    rx_direction;          //   1 byte  (offset 12)
-//     int32_t     if_index;              //   4 bytes (offset 13)
+//     u_int8_t    port_id;               //   1 byte  (offset 13)  PF_RING >= 7.8.0
+//     u_int16_t   device_id;             //   2 bytes (offset 14)  PF_RING >= 7.8.0
+//     int32_t     if_index;              //   4 bytes (offset 13 or 16)
 //     ...
 //   } extended_hdr;
+//
+// PF_RING 7.8.0 inserted port_id and device_id between rx_direction and
+// if_index, moving if_index from byte 13 to byte 16 of the extended header.
+// The old cgo code let the C compiler compute this offset; with purego the
+// offset is chosen at load time from the library version (see
+// setPkthdrOffsetsForVersion).
 var (
-	timevalSize     = int(unsafe.Sizeof(unix.Timeval{}))
-	offsetCaplen    = timevalSize
-	offsetLen       = timevalSize + 4
-	offsetExtHdr    = timevalSize + 8
-	offsetTsNs      = offsetExtHdr + 0
-	offsetIfIndex   = offsetExtHdr + 13
+	timevalSize   = int(unsafe.Sizeof(unix.Timeval{}))
+	offsetCaplen  = timevalSize
+	offsetLen     = timevalSize + 4
+	offsetExtHdr  = timevalSize + 8
+	offsetTsNs    = offsetExtHdr + 0
+	offsetIfIndex = offsetExtHdr + ifIndexOffsetLegacy
 )
+
+const (
+	// ifIndexOffsetLegacy is the offset of if_index within the extended
+	// header for PF_RING < 7.8.0 (no port_id/device_id fields).
+	ifIndexOffsetLegacy = 13
+	// ifIndexOffsetModern is the offset of if_index within the extended
+	// header for PF_RING >= 7.8.0.
+	ifIndexOffsetModern = 16
+)
+
+// setPkthdrOffsetsForVersion adjusts the pfring_pkthdr field offsets for the
+// loaded PF_RING version. version is the value returned by
+// pfring_version_noring() (0xMMmmpp encoding).
+func setPkthdrOffsetsForVersion(version uint32) {
+	if version >= 0x070800 {
+		offsetIfIndex = offsetExtHdr + ifIndexOffsetModern
+	} else {
+		offsetIfIndex = offsetExtHdr + ifIndexOffsetLegacy
+	}
+}
 
 // pfringPkthdrBufSize is a generous upper bound for the pfring_pkthdr struct.
 const pfringPkthdrBufSize = 1024

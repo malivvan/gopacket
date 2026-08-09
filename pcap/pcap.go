@@ -512,7 +512,7 @@ func bpfInstructionFilter(bpfInstructions []BPFInstruction) (bpf pcapBpfProgram,
 		return bpf, fmt.Errorf("bpfInstructions must not be larger than %d", MaxBpfInstructions)
 	}
 
-	return pcapBpfProgramFromInstructions(bpfInstructions), nil
+	return pcapBpfProgramFromInstructions(bpfInstructions)
 }
 
 // NewBPF compiles the given string into a new filter program.

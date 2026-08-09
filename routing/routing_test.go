@@ -12,6 +12,7 @@ package routing
 import (
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sort"
 	"testing"
@@ -291,7 +292,11 @@ func TestPrivateRoute(t *testing.T) {
 }
 
 func TestRouting(t *testing.T) {
-	t.Skip("failed after porting to purego") // TODO
+	// The test creates veth pairs and switches network namespaces, which
+	// requires root privileges.
+	if os.Getuid() != 0 {
+		t.Skip("TestRouting requires root privileges")
+	}
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
