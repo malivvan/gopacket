@@ -36,6 +36,7 @@ func TestSockaddrInet4RawSize(t *testing.T) {
 }
 
 func TestNewBatchNilWhenUnavailable(t *testing.T) {
+	ensureSendmmsg() // trigger the one-time lazy resolution so the zeroing below sticks
 	orig := sendmmsgAddr
 	sendmmsgAddr = 0
 	defer func() { sendmmsgAddr = orig }()
@@ -47,6 +48,7 @@ func TestNewBatchNilWhenUnavailable(t *testing.T) {
 }
 
 func TestNewBatchCreation(t *testing.T) {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		t.Skip("sendmmsg not available")
 	}
@@ -72,6 +74,7 @@ func TestNewBatchCreation(t *testing.T) {
 }
 
 func TestBatchFlushEmpty(t *testing.T) {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		t.Skip("sendmmsg not available")
 	}
@@ -85,6 +88,7 @@ func TestBatchFlushEmpty(t *testing.T) {
 }
 
 func TestBatchAddIncrementsCount(t *testing.T) {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		t.Skip("sendmmsg not available")
 	}
@@ -114,6 +118,7 @@ func TestBatchAddIncrementsCount(t *testing.T) {
 }
 
 func TestBatchIovecSetup(t *testing.T) {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		t.Skip("sendmmsg not available")
 	}
@@ -155,6 +160,7 @@ func TestBatchIovecSetup(t *testing.T) {
 }
 
 func TestBatchSendReceiveRaw(t *testing.T) {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		t.Skip("sendmmsg not available")
 	}
@@ -249,6 +255,7 @@ func TestBatchKeepUnsentCompaction(t *testing.T) {
 }
 
 func TestBatchAutoFlush(t *testing.T) {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		t.Skip("sendmmsg not available")
 	}

@@ -45,6 +45,49 @@ At runtime the `pcap` package needs libpcap installed on the target (e.g.
 the PF_RING userland library. If a library is missing, the package reports a
 clear load error instead of failing to build.
 
+## Lazy loading and `Available()`
+
+Shared libraries (libpcap, libpfring, libc) are **never** loaded at import
+time — there are no `init()` functions that call `dlopen`. Merely importing
+`gopacket`, `gopacket/pcap`, `gopacket/pfring` or `gopacket/rawsend` is always
+safe, even on systems where the libraries are missing.
+
+Loading happens automatically, lazily and exactly once (guarded by
+`sync.Once`) on the first call to any function that needs the library — e.g.
+`pcap.OpenLive`, `pcap.OpenOffline`, `pcap.Version`, `pfring.NewRing`,
+`rawsend.NewBatch`. The load result is cached: a failed load is reported as an
+error by the API and is never retried.
+
+Use `gopacket.Available()` to check whether this build can use the capture
+functionality, **without** triggering any library load:
+
+```go
+import (
+	"log"
+
+	"github.com/malivvan/gopacket"
+	"github.com/malivvan/gopacket/pcap"
+)
+
+func main() {
+	if !gopacket.Available() {
+		log.Fatal("gopacket capture is not available on this system")
+	}
+	handle, err := pcap.OpenLive("eth0", 65535, true, pcap.BlockForever)
+	// ...
+}
+```
+
+`Available()` reports `true` when the current platform (GOOS/GOARCH) is
+supported by the purego dynamic-loading layer **and** libpcap (wpcap.dll on
+Windows) is found in a well-known location. It is a best-effort, side-effect
+free probe: it only inspects the filesystem and never calls `dlopen`,
+`LoadLibrary` or any other loading mechanism, so it may report `false` for
+unusual installations (e.g. libpcap reachable only via `LD_LIBRARY_PATH` or a
+custom prefix). If you need the precise reason a load fails, call the
+package-level load functions directly (`pcap.LoadUnixPCAP()`,
+`pcap.LoadWinPCAP()`); they are idempotent and safe to call at any time.
+
 ## Supported platforms
 
 - **Linux** (amd64, 386, arm, arm64, …) — pcap, afpacket, pfring, rawsend.

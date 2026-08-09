@@ -25,7 +25,11 @@ import (
 
 const errorBufferSize = 256
 
-var pfringLoaded = false
+// pfringLoadOnce guards the lazy, one-time loading of libpfring. The library
+// is deliberately not loaded from an init() function so that merely importing
+// this package never triggers a dlopen; loading happens on the first call to
+// any function that needs libpfring.
+var pfringLoadOnce sync.Once
 
 var (
 	pfringHandle  uintptr
@@ -54,62 +58,56 @@ var (
 	pfringVersionNoringPtr uintptr
 )
 
-func init() {
-	loadPFRing()
-}
-
+// loadPFRing attempts to dynamically load the libpfring shared library and
+// resolve necessary functions. The library is loaded lazily and exactly once
+// on first use.
 func loadPFRing() error {
-	if pfringLoaded {
-		return pfringLoadErr
-	}
-
-	names := []string{
-		"libpfring.so.1",
-		"libpfring.so",
-	}
-	for _, name := range names {
-		pfringHandle, pfringLoadErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
-		if pfringLoadErr == nil {
-			break
+	pfringLoadOnce.Do(func() {
+		names := []string{
+			"libpfring.so.1",
+			"libpfring.so",
 		}
-	}
-	if pfringLoadErr != nil {
-		pfringLoadErr = fmt.Errorf("couldn't load libpfring: %w", pfringLoadErr)
-		pfringLoaded = true
-		return pfringLoadErr
-	}
+		for _, name := range names {
+			pfringHandle, pfringLoadErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+			if pfringLoadErr == nil {
+				break
+			}
+		}
+		if pfringLoadErr != nil {
+			pfringLoadErr = fmt.Errorf("couldn't load libpfring: %w", pfringLoadErr)
+			return
+		}
 
-	pfringOpenPtr = mustLoadPfring("pfring_open")
-	pfringClosePtr = mustLoadPfring("pfring_close")
-	pfringRecvPtr = mustLoadPfring("pfring_recv")
-	pfringSetClusterPtr = mustLoadPfring("pfring_set_cluster")
-	pfringRemoveFromClusterPtr = mustLoadPfring("pfring_remove_from_cluster")
-	pfringSetSamplingRatePtr = mustLoadPfring("pfring_set_sampling_rate")
-	pfringSetPollWatermarkPtr = mustLoadPfring("pfring_set_poll_watermark")
-	pfringConfigPtr = mustLoadPfring("pfring_config")
-	pfringSetPollDurationPtr = mustLoadPfring("pfring_set_poll_duration")
-	pfringSetBpfFilterPtr = mustLoadPfring("pfring_set_bpf_filter")
-	pfringRemoveBpfFilterPtr = mustLoadPfring("pfring_remove_bpf_filter")
-	pfringSendPtr = mustLoadPfring("pfring_send")
-	pfringEnableRingPtr = mustLoadPfring("pfring_enable_ring")
-	pfringDisableRingPtr = mustLoadPfring("pfring_disable_ring")
-	pfringStatsPtr = mustLoadPfring("pfring_stats")
-	pfringSetDirectionPtr = mustLoadPfring("pfring_set_direction")
-	pfringSetSocketModePtr = mustLoadPfring("pfring_set_socket_mode")
-	pfringSetApplicationNamePtr = mustLoadPfring("pfring_set_application_name")
+		pfringOpenPtr = mustLoadPfring("pfring_open")
+		pfringClosePtr = mustLoadPfring("pfring_close")
+		pfringRecvPtr = mustLoadPfring("pfring_recv")
+		pfringSetClusterPtr = mustLoadPfring("pfring_set_cluster")
+		pfringRemoveFromClusterPtr = mustLoadPfring("pfring_remove_from_cluster")
+		pfringSetSamplingRatePtr = mustLoadPfring("pfring_set_sampling_rate")
+		pfringSetPollWatermarkPtr = mustLoadPfring("pfring_set_poll_watermark")
+		pfringConfigPtr = mustLoadPfring("pfring_config")
+		pfringSetPollDurationPtr = mustLoadPfring("pfring_set_poll_duration")
+		pfringSetBpfFilterPtr = mustLoadPfring("pfring_set_bpf_filter")
+		pfringRemoveBpfFilterPtr = mustLoadPfring("pfring_remove_bpf_filter")
+		pfringSendPtr = mustLoadPfring("pfring_send")
+		pfringEnableRingPtr = mustLoadPfring("pfring_enable_ring")
+		pfringDisableRingPtr = mustLoadPfring("pfring_disable_ring")
+		pfringStatsPtr = mustLoadPfring("pfring_stats")
+		pfringSetDirectionPtr = mustLoadPfring("pfring_set_direction")
+		pfringSetSocketModePtr = mustLoadPfring("pfring_set_socket_mode")
+		pfringSetApplicationNamePtr = mustLoadPfring("pfring_set_application_name")
 
-	// The layout of pfring_extended_pkthdr changed in PF_RING 7.8.0
-	// (port_id/device_id fields were inserted before if_index), so pick the
-	// right field offsets based on the loaded library version.
-	pfringVersionNoringPtr, _ = purego.Dlsym(pfringHandle, "pfring_version_noring")
-	if pfringVersionNoringPtr != 0 {
-		var version uint32
-		purego.SyscallN(pfringVersionNoringPtr, uintptr(unsafe.Pointer(&version)))
-		setPkthdrOffsetsForVersion(version)
-	}
-
-	pfringLoaded = true
-	return nil
+		// The layout of pfring_extended_pkthdr changed in PF_RING 7.8.0
+		// (port_id/device_id fields were inserted before if_index), so pick the
+		// right field offsets based on the loaded library version.
+		pfringVersionNoringPtr, _ = purego.Dlsym(pfringHandle, "pfring_version_noring")
+		if pfringVersionNoringPtr != 0 {
+			var version uint32
+			purego.SyscallN(pfringVersionNoringPtr, uintptr(unsafe.Pointer(&version)))
+			setPkthdrOffsetsForVersion(version)
+		}
+	})
+	return pfringLoadErr
 }
 
 func mustLoadPfring(name string) uintptr {

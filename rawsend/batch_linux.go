@@ -4,6 +4,7 @@ package rawsend
 
 import (
 	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -13,16 +14,27 @@ import (
 
 var sendmmsgAddr uintptr
 
-func init() {
-	libc, err := purego.Dlopen("libc.so.6", purego.RTLD_LAZY)
-	if err != nil {
-		return
-	}
-	addr, err := purego.Dlsym(libc, "sendmmsg")
-	if err != nil {
-		return
-	}
-	sendmmsgAddr = addr
+// sendmmsgLoadOnce guards the lazy, one-time resolution of the sendmmsg libc
+// symbol. The library is deliberately not loaded from an init() function so
+// that merely importing this package never triggers a dlopen; resolution
+// happens on first use (see ensureSendmmsg).
+var sendmmsgLoadOnce sync.Once
+
+// ensureSendmmsg resolves the sendmmsg symbol from libc exactly once. It is a
+// no-op when sendmmsg is not available (e.g. musl or older glibc), in which
+// case sendmmsgAddr stays 0 and callers degrade gracefully.
+func ensureSendmmsg() {
+	sendmmsgLoadOnce.Do(func() {
+		libc, err := purego.Dlopen("libc.so.6", purego.RTLD_LAZY)
+		if err != nil {
+			return
+		}
+		addr, err := purego.Dlsym(libc, "sendmmsg")
+		if err != nil {
+			return
+		}
+		sendmmsgAddr = addr
+	})
 }
 
 // mmsghdr mirrors C struct mmsghdr. Using unix.Msghdr ensures
@@ -62,6 +74,7 @@ type Batch struct {
 // packets of at most maxPktLen bytes each, sending them all in one
 // sendmmsg syscall.  Returns nil if sendmmsg is not available.
 func NewBatch(fd socketFD, batchSize, maxPktLen int) *Batch {
+	ensureSendmmsg()
 	if sendmmsgAddr == 0 {
 		return nil
 	}

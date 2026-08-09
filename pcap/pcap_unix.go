@@ -25,7 +25,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var pcapLoaded = false
+// pcapLoadOnce guards the lazy, one-time loading of libpcap. The library is
+// deliberately not loaded from an init() function so that merely importing this
+// package never triggers a dlopen; loading happens on the first call to any
+// function that needs libpcap (or on an explicit LoadUnixPCAP call).
+var pcapLoadOnce sync.Once
 
 var (
 	pcapHandle  uintptr
@@ -81,10 +85,6 @@ var (
 	pcapGetSelectableFdPtr uintptr
 )
 
-func init() {
-	LoadUnixPCAP()
-}
-
 // libcMallocPtr holds the resolved malloc symbol from the C standard library.
 // It is used to allocate memory that libpcap will release with pcap_freecode
 // (which calls C's free()). Memory coming from the Go heap must never be handed
@@ -134,78 +134,74 @@ func loadLibcAllocators() error {
 }
 
 // LoadUnixPCAP attempts to dynamically load the libpcap shared library and resolve necessary functions.
+// The library is loaded lazily and exactly once on first use.
 func LoadUnixPCAP() error {
-	if pcapLoaded {
-		return pcapLoadErr
-	}
-
-	names := []string{
-		"libpcap.so.1",
-		"libpcap.so",
-		"libpcap.dylib",
-		"libpcap.so.0.8",
-	}
-	for _, name := range names {
-		pcapHandle, pcapLoadErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
-		if pcapLoadErr == nil {
-			break
+	pcapLoadOnce.Do(func() {
+		names := []string{
+			"libpcap.so.1",
+			"libpcap.so",
+			"libpcap.dylib",
+			"libpcap.so.0.8",
 		}
-	}
-	if pcapLoadErr != nil {
-		pcapLoadErr = fmt.Errorf("couldn't load libpcap: %w", pcapLoadErr)
-		pcapLoaded = true
-		return pcapLoadErr
-	}
+		for _, name := range names {
+			pcapHandle, pcapLoadErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+			if pcapLoadErr == nil {
+				break
+			}
+		}
+		if pcapLoadErr != nil {
+			pcapLoadErr = fmt.Errorf("couldn't load libpcap: %w", pcapLoadErr)
+			return
+		}
 
-	pcapStrerrorPtr = mustLoad("pcap_strerror")
-	pcapStatustostrPtr = mightLoad("pcap_statustostr")
-	pcapOpenLivePtr = mustLoad("pcap_open_live")
-	pcapOpenOfflinePtr = mustLoad("pcap_open_offline")
-	pcapClosePtr = mustLoad("pcap_close")
-	pcapGeterrPtr = mustLoad("pcap_geterr")
-	pcapStatsPtr = mustLoad("pcap_stats")
-	pcapCompilePtr = mustLoad("pcap_compile")
-	pcapFreecodePtr = mustLoad("pcap_freecode")
-	pcapLookupnetPtr = mustLoad("pcap_lookupnet")
-	pcapOfflineFilterPtr = mustLoad("pcap_offline_filter")
-	pcapSetfilterPtr = mustLoad("pcap_setfilter")
-	pcapListDatalinksPtr = mustLoad("pcap_list_datalinks")
-	pcapFreeDatalinksPtr = mustLoad("pcap_free_datalinks")
-	pcapDatalinkValToNamePtr = mustLoad("pcap_datalink_val_to_name")
-	pcapDatalinkValToDescriptionPtr = mustLoad("pcap_datalink_val_to_description")
-	pcapOpenDeadPtr = mustLoad("pcap_open_dead")
-	pcapNextExPtr = mustLoad("pcap_next_ex")
-	pcapDatalinkPtr = mustLoad("pcap_datalink")
-	pcapSetDatalinkPtr = mustLoad("pcap_set_datalink")
-	pcapDatalinkNameToValPtr = mustLoad("pcap_datalink_name_to_val")
-	pcapLibVersionPtr = mustLoad("pcap_lib_version")
-	pcapFreealldevsPtr = mustLoad("pcap_freealldevs")
-	pcapFindalldevsPtr = mustLoad("pcap_findalldevs")
-	pcapSendpacketPtr = mustLoad("pcap_sendpacket")
-	pcapSetdirectionPtr = mustLoad("pcap_setdirection")
-	pcapSnapshotPtr = mustLoad("pcap_snapshot")
-	pcapTstampTypeValToNamePtr = mightLoad("pcap_tstamp_type_val_to_name")
-	pcapTstampTypeNameToValPtr = mightLoad("pcap_tstamp_type_name_to_val")
-	pcapListTstampTypesPtr = mightLoad("pcap_list_tstamp_types")
-	pcapFreeTstampTypesPtr = mightLoad("pcap_free_tstamp_types")
-	pcapSetTstampTypePtr = mightLoad("pcap_set_tstamp_type")
-	pcapGetTstampPrecisionPtr = mightLoad("pcap_get_tstamp_precision")
-	pcapSetTstampPrecisionPtr = mightLoad("pcap_set_tstamp_precision")
-	pcapOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_open_offline_with_tstamp_precision")
-	pcapActivatePtr = mustLoad("pcap_activate")
-	pcapCreatePtr = mustLoad("pcap_create")
-	pcapSetSnaplenPtr = mustLoad("pcap_set_snaplen")
-	pcapSetPromiscPtr = mustLoad("pcap_set_promisc")
-	pcapSetTimeoutPtr = mustLoad("pcap_set_timeout")
-	pcapCanSetRfmonPtr = mightLoad("pcap_can_set_rfmon")
-	pcapSetRfmonPtr = mightLoad("pcap_set_rfmon")
-	pcapSetBufferSizePtr = mustLoad("pcap_set_buffer_size")
-	pcapSetImmediateModePtr = mightLoad("pcap_set_immediate_mode")
-	pcapSetNonBlockPtr = mustLoad("pcap_setnonblock")
-	pcapGetSelectableFdPtr = mustLoad("pcap_get_selectable_fd")
-
-	pcapLoaded = true
-	return nil
+		pcapStrerrorPtr = mustLoad("pcap_strerror")
+		pcapStatustostrPtr = mightLoad("pcap_statustostr")
+		pcapOpenLivePtr = mustLoad("pcap_open_live")
+		pcapOpenOfflinePtr = mustLoad("pcap_open_offline")
+		pcapClosePtr = mustLoad("pcap_close")
+		pcapGeterrPtr = mustLoad("pcap_geterr")
+		pcapStatsPtr = mustLoad("pcap_stats")
+		pcapCompilePtr = mustLoad("pcap_compile")
+		pcapFreecodePtr = mustLoad("pcap_freecode")
+		pcapLookupnetPtr = mustLoad("pcap_lookupnet")
+		pcapOfflineFilterPtr = mustLoad("pcap_offline_filter")
+		pcapSetfilterPtr = mustLoad("pcap_setfilter")
+		pcapListDatalinksPtr = mustLoad("pcap_list_datalinks")
+		pcapFreeDatalinksPtr = mustLoad("pcap_free_datalinks")
+		pcapDatalinkValToNamePtr = mustLoad("pcap_datalink_val_to_name")
+		pcapDatalinkValToDescriptionPtr = mustLoad("pcap_datalink_val_to_description")
+		pcapOpenDeadPtr = mustLoad("pcap_open_dead")
+		pcapNextExPtr = mustLoad("pcap_next_ex")
+		pcapDatalinkPtr = mustLoad("pcap_datalink")
+		pcapSetDatalinkPtr = mustLoad("pcap_set_datalink")
+		pcapDatalinkNameToValPtr = mustLoad("pcap_datalink_name_to_val")
+		pcapLibVersionPtr = mustLoad("pcap_lib_version")
+		pcapFreealldevsPtr = mustLoad("pcap_freealldevs")
+		pcapFindalldevsPtr = mustLoad("pcap_findalldevs")
+		pcapSendpacketPtr = mustLoad("pcap_sendpacket")
+		pcapSetdirectionPtr = mustLoad("pcap_setdirection")
+		pcapSnapshotPtr = mustLoad("pcap_snapshot")
+		pcapTstampTypeValToNamePtr = mightLoad("pcap_tstamp_type_val_to_name")
+		pcapTstampTypeNameToValPtr = mightLoad("pcap_tstamp_type_name_to_val")
+		pcapListTstampTypesPtr = mightLoad("pcap_list_tstamp_types")
+		pcapFreeTstampTypesPtr = mightLoad("pcap_free_tstamp_types")
+		pcapSetTstampTypePtr = mightLoad("pcap_set_tstamp_type")
+		pcapGetTstampPrecisionPtr = mightLoad("pcap_get_tstamp_precision")
+		pcapSetTstampPrecisionPtr = mightLoad("pcap_set_tstamp_precision")
+		pcapOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_open_offline_with_tstamp_precision")
+		pcapActivatePtr = mustLoad("pcap_activate")
+		pcapCreatePtr = mustLoad("pcap_create")
+		pcapSetSnaplenPtr = mustLoad("pcap_set_snaplen")
+		pcapSetPromiscPtr = mustLoad("pcap_set_promisc")
+		pcapSetTimeoutPtr = mustLoad("pcap_set_timeout")
+		pcapCanSetRfmonPtr = mightLoad("pcap_can_set_rfmon")
+		pcapSetRfmonPtr = mightLoad("pcap_set_rfmon")
+		pcapSetBufferSizePtr = mustLoad("pcap_set_buffer_size")
+		pcapSetImmediateModePtr = mightLoad("pcap_set_immediate_mode")
+		pcapSetNonBlockPtr = mustLoad("pcap_setnonblock")
+		pcapGetSelectableFdPtr = mustLoad("pcap_get_selectable_fd")
+	})
+	return pcapLoadErr
 }
 
 func mustLoad(name string) uintptr {

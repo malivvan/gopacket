@@ -8,9 +8,9 @@
 package pcap
 
 import (
-	"github.com/ebitengine/purego"
 	"errors"
 	"fmt"
+	"github.com/ebitengine/purego"
 	"os"
 	"runtime"
 	"sync"
@@ -23,7 +23,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var pcapLoaded = false
+// pcapLoadOnce guards the lazy, one-time loading of wpcap.dll. The DLL is
+// deliberately not loaded from an init() function so that merely importing this
+// package never triggers a library load; loading happens on the first call to
+// any function that needs wpcap (or on an explicit LoadWinPCAP call).
+var pcapLoadOnce sync.Once
+
+// pcapLoadErr caches the result of the one-time wpcap.dll load.
+var pcapLoadErr error
 
 const npcapPath = "\\Npcap"
 
@@ -135,102 +142,100 @@ var (
 	pcapHopenOfflinePtr uintptr
 )
 
-func init() {
-	LoadWinPCAP()
-}
-
-// LoadWinPCAP attempts to dynamically load the wpcap DLL and resolve necessary functions
+// LoadWinPCAP attempts to dynamically load the wpcap DLL and resolve necessary functions.
+// The DLL is loaded lazily and exactly once on first use.
 func LoadWinPCAP() error {
-	if pcapLoaded {
-		return nil
-	}
-
-	kernel32, err := windows.LoadLibrary("kernel32.dll")
-	if err != nil {
-		return fmt.Errorf("couldn't load kernel32.dll")
-	}
-	defer windows.FreeLibrary(kernel32)
-
-	initDllPath(kernel32)
-
-	if haveSearch, _ := windows.GetProcAddress(kernel32, "AddDllDirectory"); haveSearch != 0 {
-		// if AddDllDirectory is present, we can use LOAD_LIBRARY_* stuff with LoadLibraryEx to avoid wpcap.dll hijacking
-		// see: https://msdn.microsoft.com/en-us/library/ff919712%28VS.85%29.aspx
-		const LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400
-		const LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
-		wpcapHandle, err = windows.LoadLibraryEx("wpcap.dll", 0, LOAD_LIBRARY_SEARCH_USER_DIRS|LOAD_LIBRARY_SEARCH_SYSTEM32)
+	pcapLoadOnce.Do(func() {
+		kernel32, err := windows.LoadLibrary("kernel32.dll")
 		if err != nil {
-			return fmt.Errorf("couldn't load wpcap.dll")
+			pcapLoadErr = fmt.Errorf("couldn't load kernel32.dll")
+			return
 		}
-	} else {
-		// otherwise fall back to load it with the unsafe search cause by SetDllDirectory
-		wpcapHandle, err = windows.LoadLibrary("wpcap.dll")
+		defer windows.FreeLibrary(kernel32)
+
+		initDllPath(kernel32)
+
+		if haveSearch, _ := windows.GetProcAddress(kernel32, "AddDllDirectory"); haveSearch != 0 {
+			// if AddDllDirectory is present, we can use LOAD_LIBRARY_* stuff with LoadLibraryEx to avoid wpcap.dll hijacking
+			// see: https://msdn.microsoft.com/en-us/library/ff919712%28VS.85%29.aspx
+			const LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400
+			const LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+			wpcapHandle, err = windows.LoadLibraryEx("wpcap.dll", 0, LOAD_LIBRARY_SEARCH_USER_DIRS|LOAD_LIBRARY_SEARCH_SYSTEM32)
+			if err != nil {
+				pcapLoadErr = fmt.Errorf("couldn't load wpcap.dll")
+				return
+			}
+		} else {
+			// otherwise fall back to load it with the unsafe search cause by SetDllDirectory
+			wpcapHandle, err = windows.LoadLibrary("wpcap.dll")
+			if err != nil {
+				pcapLoadErr = fmt.Errorf("couldn't load wpcap.dll")
+				return
+			}
+		}
+		initLoadedDllPath(kernel32)
+		msvcrtHandle, err = windows.LoadLibrary("msvcrt.dll")
 		if err != nil {
-			return fmt.Errorf("couldn't load wpcap.dll")
+			pcapLoadErr = fmt.Errorf("couldn't load msvcrt.dll")
+			return
 		}
-	}
-	initLoadedDllPath(kernel32)
-	msvcrtHandle, err = windows.LoadLibrary("msvcrt.dll")
-	if err != nil {
-		return fmt.Errorf("couldn't load msvcrt.dll")
-	}
-	callocPtr, err = windows.GetProcAddress(msvcrtHandle, "calloc")
-	if err != nil {
-		return fmt.Errorf("couldn't get calloc function")
-	}
+		callocPtr, err = windows.GetProcAddress(msvcrtHandle, "calloc")
+		if err != nil {
+			pcapLoadErr = fmt.Errorf("couldn't get calloc function")
+			return
+		}
 
-	pcapStrerrorPtr = mustLoad("pcap_strerror")
-	pcapStatustostrPtr = mightLoad("pcap_statustostr") // not available on winpcap
-	pcapOpenLivePtr = mustLoad("pcap_open_live")
-	pcapOpenOfflinePtr = mustLoad("pcap_open_offline")
-	pcapClosePtr = mustLoad("pcap_close")
-	pcapGeterrPtr = mustLoad("pcap_geterr")
-	pcapStatsPtr = mustLoad("pcap_stats")
-	pcapCompilePtr = mustLoad("pcap_compile")
-	pcapFreecodePtr = mustLoad("pcap_freecode")
-	pcapLookupnetPtr = mustLoad("pcap_lookupnet")
-	pcapOfflineFilterPtr = mustLoad("pcap_offline_filter")
-	pcapSetfilterPtr = mustLoad("pcap_setfilter")
-	pcapListDatalinksPtr = mustLoad("pcap_list_datalinks")
-	pcapFreeDatalinksPtr = mustLoad("pcap_free_datalinks")
-	pcapDatalinkValToNamePtr = mustLoad("pcap_datalink_val_to_name")
-	pcapDatalinkValToDescriptionPtr = mustLoad("pcap_datalink_val_to_description")
-	pcapOpenDeadPtr = mustLoad("pcap_open_dead")
-	pcapNextExPtr = mustLoad("pcap_next_ex")
-	pcapDatalinkPtr = mustLoad("pcap_datalink")
-	pcapSetDatalinkPtr = mustLoad("pcap_set_datalink")
-	pcapDatalinkNameToValPtr = mustLoad("pcap_datalink_name_to_val")
-	pcapLibVersionPtr = mustLoad("pcap_lib_version")
-	pcapFreealldevsPtr = mustLoad("pcap_freealldevs")
-	pcapFindalldevsPtr = mustLoad("pcap_findalldevs")
-	pcapSendpacketPtr = mustLoad("pcap_sendpacket")
-	pcapSetdirectionPtr = mustLoad("pcap_setdirection")
-	pcapSnapshotPtr = mustLoad("pcap_snapshot")
-	//libpcap <1.2 doesn't have pcap_*_tstamp_* functions
-	pcapTstampTypeValToNamePtr = mightLoad("pcap_tstamp_type_val_to_name")
-	pcapTstampTypeNameToValPtr = mightLoad("pcap_tstamp_type_name_to_val")
-	pcapListTstampTypesPtr = mightLoad("pcap_list_tstamp_types")
-	pcapFreeTstampTypesPtr = mightLoad("pcap_free_tstamp_types")
-	pcapSetTstampTypePtr = mightLoad("pcap_set_tstamp_type")
-	pcapGetTstampPrecisionPtr = mightLoad("pcap_get_tstamp_precision")
-	pcapSetTstampPrecisionPtr = mightLoad("pcap_set_tstamp_precision")
-	pcapOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_open_offline_with_tstamp_precision")
-	pcapHOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_hopen_offline_with_tstamp_precision")
-	pcapActivatePtr = mustLoad("pcap_activate")
-	pcapCreatePtr = mustLoad("pcap_create")
-	pcapSetSnaplenPtr = mustLoad("pcap_set_snaplen")
-	pcapSetPromiscPtr = mustLoad("pcap_set_promisc")
-	pcapSetTimeoutPtr = mustLoad("pcap_set_timeout")
-	//winpcap does not support rfmon
-	pcapCanSetRfmonPtr = mightLoad("pcap_can_set_rfmon")
-	pcapSetRfmonPtr = mightLoad("pcap_set_rfmon")
-	pcapSetBufferSizePtr = mustLoad("pcap_set_buffer_size")
-	//libpcap <1.5 does not have pcap_set_immediate_mode
-	pcapSetImmediateModePtr = mightLoad("pcap_set_immediate_mode")
-	pcapHopenOfflinePtr = mustLoad("pcap_hopen_offline")
-
-	pcapLoaded = true
-	return nil
+		pcapStrerrorPtr = mustLoad("pcap_strerror")
+		pcapStatustostrPtr = mightLoad("pcap_statustostr") // not available on winpcap
+		pcapOpenLivePtr = mustLoad("pcap_open_live")
+		pcapOpenOfflinePtr = mustLoad("pcap_open_offline")
+		pcapClosePtr = mustLoad("pcap_close")
+		pcapGeterrPtr = mustLoad("pcap_geterr")
+		pcapStatsPtr = mustLoad("pcap_stats")
+		pcapCompilePtr = mustLoad("pcap_compile")
+		pcapFreecodePtr = mustLoad("pcap_freecode")
+		pcapLookupnetPtr = mustLoad("pcap_lookupnet")
+		pcapOfflineFilterPtr = mustLoad("pcap_offline_filter")
+		pcapSetfilterPtr = mustLoad("pcap_setfilter")
+		pcapListDatalinksPtr = mustLoad("pcap_list_datalinks")
+		pcapFreeDatalinksPtr = mustLoad("pcap_free_datalinks")
+		pcapDatalinkValToNamePtr = mustLoad("pcap_datalink_val_to_name")
+		pcapDatalinkValToDescriptionPtr = mustLoad("pcap_datalink_val_to_description")
+		pcapOpenDeadPtr = mustLoad("pcap_open_dead")
+		pcapNextExPtr = mustLoad("pcap_next_ex")
+		pcapDatalinkPtr = mustLoad("pcap_datalink")
+		pcapSetDatalinkPtr = mustLoad("pcap_set_datalink")
+		pcapDatalinkNameToValPtr = mustLoad("pcap_datalink_name_to_val")
+		pcapLibVersionPtr = mustLoad("pcap_lib_version")
+		pcapFreealldevsPtr = mustLoad("pcap_freealldevs")
+		pcapFindalldevsPtr = mustLoad("pcap_findalldevs")
+		pcapSendpacketPtr = mustLoad("pcap_sendpacket")
+		pcapSetdirectionPtr = mustLoad("pcap_setdirection")
+		pcapSnapshotPtr = mustLoad("pcap_snapshot")
+		//libpcap <1.2 doesn't have pcap_*_tstamp_* functions
+		pcapTstampTypeValToNamePtr = mightLoad("pcap_tstamp_type_val_to_name")
+		pcapTstampTypeNameToValPtr = mightLoad("pcap_tstamp_type_name_to_val")
+		pcapListTstampTypesPtr = mightLoad("pcap_list_tstamp_types")
+		pcapFreeTstampTypesPtr = mightLoad("pcap_free_tstamp_types")
+		pcapSetTstampTypePtr = mightLoad("pcap_set_tstamp_type")
+		pcapGetTstampPrecisionPtr = mightLoad("pcap_get_tstamp_precision")
+		pcapSetTstampPrecisionPtr = mightLoad("pcap_set_tstamp_precision")
+		pcapOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_open_offline_with_tstamp_precision")
+		pcapHOpenOfflineWithTstampPrecisionPtr = mightLoad("pcap_hopen_offline_with_tstamp_precision")
+		pcapActivatePtr = mustLoad("pcap_activate")
+		pcapCreatePtr = mustLoad("pcap_create")
+		pcapSetSnaplenPtr = mustLoad("pcap_set_snaplen")
+		pcapSetPromiscPtr = mustLoad("pcap_set_promisc")
+		pcapSetTimeoutPtr = mustLoad("pcap_set_timeout")
+		//winpcap does not support rfmon
+		pcapCanSetRfmonPtr = mightLoad("pcap_can_set_rfmon")
+		pcapSetRfmonPtr = mightLoad("pcap_set_rfmon")
+		pcapSetBufferSizePtr = mustLoad("pcap_set_buffer_size")
+		//libpcap <1.5 does not have pcap_set_immediate_mode
+		pcapSetImmediateModePtr = mightLoad("pcap_set_immediate_mode")
+		pcapHopenOfflinePtr = mustLoad("pcap_hopen_offline")
+	})
+	return pcapLoadErr
 }
 
 func (h *pcapPkthdr) getSec() int64 {
