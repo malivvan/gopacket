@@ -1,4 +1,4 @@
-# GoPacket
+# gopacket [![godoc](https://godoc.org/github.com/malivvan/gopacket?status.svg)](https://godoc.org/github.com/malivvan/gopacket) ![test](https://github.com/malivvan/gopacket/workflows/test/badge.svg) [![Coverage Status](https://coveralls.io/repos/github/malivvan/gopacket/badge.svg?branch=master)](https://coveralls.io/github/malivvan/gopacket?branch=master) [![Release](https://img.shields.io/github/v/release/malivvan/gopacket.svg?sort=semver)](https://github.com/malivvan/gopacket/releases/latest) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 This library provides packet decoding capabilities for Go.
 
